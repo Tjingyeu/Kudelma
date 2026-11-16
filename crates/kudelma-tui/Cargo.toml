@@ -1,0 +1,21 @@
+[package]
+name = "kudelma-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ignore.workspace = true
+kudelma-config.workspace = true
+kudelma-core.workspace = true
+kudelma-permissions.workspace = true
+kudelma-providers.workspace = true
+kudelma-storage.workspace = true
+kudelma-tools.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
