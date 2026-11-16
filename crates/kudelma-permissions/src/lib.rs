@@ -12,11 +12,41 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use serde::{Deserialize, Serialize};
+
 use kudelma_config::{Config, DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
 use kudelma_storage::{atomic_write, canonicalize_lenient, is_within};
 
 pub const WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
-pub const READ_TOOLS: &[&str] = &["read", "glob", "grep", "index", "ls"];
+pub const READ_TOOLS: &[&str] = &["read", "glob", "grep", "index", "ls", "explore_codebase"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Agency,
+    Lead,
+    Coder,
+}
+
+impl AgentRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Agency => "agency",
+            Self::Lead => "lead",
+            Self::Coder => "coder",
+        }
+    }
+
+    pub fn read_only(self) -> bool {
+        matches!(self, Self::Agency)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoderScope {
+    pub allowed_paths: Vec<PathBuf>,
+    pub forbidden_paths: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionCheck {
@@ -111,6 +141,8 @@ pub struct PermissionManager {
     trusted: bool,
     project_file: PathBuf,
     global_file: PathBuf,
+    pub role: AgentRole,
+    pub coder_scope: CoderScope,
 }
 
 impl PermissionManager {
@@ -142,6 +174,8 @@ impl PermissionManager {
             trusted,
             project_file: kudelma_config::project_permissions_path(cwd),
             global_file: kudelma_config::global_config_path(),
+            role: AgentRole::Lead,
+            coder_scope: CoderScope::default(),
         }
     }
 
@@ -162,6 +196,29 @@ impl PermissionManager {
             trusted: true,
             project_file: cwd.join(".kudelma/permissions.toml"),
             global_file: cwd.join(".kudelma/global.toml"),
+            role: AgentRole::Lead,
+            coder_scope: CoderScope::default(),
+        }
+    }
+
+    pub fn for_role(&self, role: AgentRole, coder_scope: CoderScope) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            rules: self.rules.clone(),
+            default: self.default,
+            session_rules: RwLock::new(
+                self.session_rules
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            yolo: self.yolo,
+            plan_path: RwLock::new(None),
+            trusted: self.trusted,
+            project_file: self.project_file.clone(),
+            global_file: self.global_file.clone(),
+            role,
+            coder_scope,
         }
     }
 
@@ -260,6 +317,10 @@ impl PermissionManager {
             }
         }
 
+        if let Some(reason) = self.role_denial(tool, scopes) {
+            return PermissionCheck::Denied(reason);
+        }
+
         let plan = self.plan_path();
         if let Some(plan_path) = &plan {
             if is_write_tool(tool) {
@@ -333,6 +394,74 @@ impl PermissionManager {
         }
     }
 
+    fn role_denial(&self, tool: &ToolKey, scopes: &[Scope]) -> Option<String> {
+        if let ToolKey::Native(name) = tool {
+            match name.as_str() {
+                "submit_contract" if self.role != AgentRole::Agency => {
+                    return Some("only agency may submit a task contract".into());
+                }
+                "explore_codebase" if !matches!(self.role, AgentRole::Agency | AgentRole::Lead) => {
+                    return Some(
+                        "only agency and lead may use the shared exploration capability".into(),
+                    );
+                }
+                "lead_mode" if self.role != AgentRole::Lead => {
+                    return Some("only lead may change the lead mode".into());
+                }
+                "verify" if !matches!(self.role, AgentRole::Lead | AgentRole::Coder) => {
+                    return Some("only lead and coder may run verification".into());
+                }
+                _ => {}
+            }
+        }
+        match self.role {
+            AgentRole::Lead => None,
+            AgentRole::Agency => {
+                let denied = is_write_tool(tool)
+                    || is_bash(tool)
+                    || tool.is_mcp()
+                    || matches!(tool, ToolKey::Native(name) if name == "task");
+                denied.then(|| {
+                    "agency is read-only and cannot write, run commands, dispatch coder, or call MCP"
+                        .to_string()
+                })
+            }
+            AgentRole::Coder => {
+                if matches!(tool, ToolKey::Native(name) if name == "task") {
+                    return Some("coder cannot dispatch agents".into());
+                }
+                if !is_write_tool(tool) {
+                    return None;
+                }
+                for scope in scopes {
+                    let path = canonicalize_lenient(Path::new(&scope.value));
+                    for forbidden in &self.coder_scope.forbidden_paths {
+                        let forbidden = canonicalize_lenient(forbidden);
+                        if path == forbidden || path.starts_with(&forbidden) {
+                            return Some(format!(
+                                "path {} is outside the coder's allowed scope",
+                                path.display()
+                            ));
+                        }
+                    }
+                    if !self.coder_scope.allowed_paths.is_empty() {
+                        let allowed = self.coder_scope.allowed_paths.iter().any(|allowed| {
+                            let allowed = canonicalize_lenient(allowed);
+                            path == allowed || path.starts_with(&allowed)
+                        });
+                        if !allowed {
+                            return Some(format!(
+                                "path {} is outside the coder's allowed paths",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
     fn builtin_check(&self, tool: &ToolKey, scopes: &[Scope]) -> Option<PermissionCheck> {
         let ToolKey::Native(name) = tool else {
             return None;
@@ -364,6 +493,9 @@ impl PermissionManager {
                     reason: Some("write is outside the workspace".into()),
                 }
             });
+        }
+        if matches!(name.as_str(), "skill" | "lead_mode" | "submit_contract") {
+            return Some(PermissionCheck::Allowed);
         }
         if matches!(name.as_str(), "todo_write" | "memory" | "task") {
             return Some(PermissionCheck::Allowed);
@@ -623,5 +755,92 @@ mod tests {
             ),
             PermissionCheck::Allowed
         );
+    }
+
+    #[test]
+    fn agency_is_read_only_even_under_yolo() {
+        let mut manager = manager(DefaultEffect::Allow, vec![]);
+        manager.set_yolo(true);
+        let manager = manager.for_role(AgentRole::Agency, CoderScope::default());
+        assert!(matches!(
+            manager.check(&ToolKey::native("write"), &[Scope::path("/work/a.txt")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("bash"), &[Scope::command("true")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("task"), &[Scope::exact("task:x")]),
+            PermissionCheck::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn only_agency_and_lead_may_use_shared_exploration() {
+        let manager = manager(DefaultEffect::Allow, vec![]);
+        for role in [AgentRole::Agency, AgentRole::Lead] {
+            let manager = manager.for_role(role, CoderScope::default());
+            assert_eq!(
+                manager.check(
+                    &ToolKey::native("explore_codebase"),
+                    &[Scope::path("/work/src/main.rs")]
+                ),
+                PermissionCheck::Allowed
+            );
+        }
+        let coder = manager.for_role(AgentRole::Coder, CoderScope::default());
+        assert!(matches!(
+            coder.check(
+                &ToolKey::native("explore_codebase"),
+                &[Scope::path("/work/src/main.rs")]
+            ),
+            PermissionCheck::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn exploration_outside_the_workspace_prompts() {
+        let manager = manager(DefaultEffect::Allow, vec![]);
+        for role in [AgentRole::Agency, AgentRole::Lead] {
+            let manager = manager.for_role(role, CoderScope::default());
+            assert!(matches!(
+                manager.check(&ToolKey::native("explore_codebase"), &[Scope::path("/etc")]),
+                PermissionCheck::NeedsPrompt { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn coder_scope_is_enforced_before_yolo() {
+        let manager = manager(DefaultEffect::Allow, vec![]).for_role(
+            AgentRole::Coder,
+            CoderScope {
+                allowed_paths: vec![PathBuf::from("/work/src")],
+                forbidden_paths: vec![PathBuf::from("/work/src/secret")],
+            },
+        );
+        assert_eq!(
+            manager.check(
+                &ToolKey::native("write"),
+                &[Scope::path("/work/src/main.rs")]
+            ),
+            PermissionCheck::Allowed
+        );
+        assert!(matches!(
+            manager.check(&ToolKey::native("write"), &[Scope::path("/work/other.rs")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(
+                &ToolKey::native("write"),
+                &[Scope::path("/work/src/secret/key.rs")]
+            ),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("task"), &[Scope::exact("task:x")]),
+            PermissionCheck::Denied(_)
+        ));
     }
 }

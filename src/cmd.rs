@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use color_eyre::eyre::{Result, bail};
-use kudelma_config::{Config, global_config_path};
+use kudelma_config::{Config, WorkflowPreset, global_config_path};
+use kudelma_core::skills::SkillRegistry;
+use kudelma_core::workflows::WorkflowStore;
 use kudelma_core::{AgentMode, SessionHandle};
 use kudelma_providers::{ProviderPreset, all_models, builtin_providers, resolve_model};
 use kudelma_storage::{
-    AuthStore, SessionClaim, SessionStore, StoredSession, TrustStore, atomic_write,
-    canonicalize_lenient, new_id, now_rfc3339, state_dir,
+    ArtifactStore, AuthStore, SessionClaim, SessionStore, StoredSession, TrustStore, atomic_write,
+    canonicalize_lenient, new_id, now_rfc3339, state_dir, tasks_dir,
 };
 use kudelma_tools::{
     IndexTool, LocalEnv, Tool, ToolContext, ToolRegistry, ToolSearchTool, builtin_tools,
@@ -16,7 +18,7 @@ use kudelma_tools::{
 
 use crate::cli::{
     AcpArgs, AuthAction, Cli, Command, ConfigAction, InputFormat, OutputFormat, PromptArgs,
-    SessionAction, TrustAction,
+    SessionAction, SkillAction, TaskAction, TrustAction, WorkflowAction,
 };
 use crate::headless::{HeadlessOptions, check_credentials};
 
@@ -25,6 +27,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Auth { action }) => auth(action).await,
         Some(Command::Models { .. }) => models(),
         Some(Command::Session { action }) => sessions(action).await,
+        Some(Command::Skill { action }) => skills_command(action),
+        Some(Command::Workflow { action }) => workflows_command(action).await,
+        Some(Command::Task { action }) => tasks_command(action),
         Some(Command::Index { path }) => index(path).await,
         Some(Command::Trust { action }) => trust(action),
         Some(Command::Prompt(args)) => prompt(args),
@@ -67,6 +72,7 @@ async fn run_default(cli: Cli) -> Result<()> {
     let stdin_tty = std::io::stdin().is_terminal();
     let stdout_tty = std::io::stdout().is_terminal();
     let interactive = !cli.print && stdout_tty && (stdin_tty || cli.prompt.is_some());
+    let direct_lead = cli.direct_lead || cli.mode.is_some() || cli.plan;
 
     if interactive {
         let params = kudelma_tui::TuiParams {
@@ -77,6 +83,9 @@ async fn run_default(cli: Cli) -> Result<()> {
             yolo: cli.yolo,
             trusted,
             plan: cli.plan,
+            mode: cli.mode,
+            workflow: cli.workflow.as_deref().map(parse_workflow),
+            direct_lead,
             max_turns: cli.max_turns,
             system_prompt: cli.system_prompt,
             append_system_prompt: cli.append_system_prompt,
@@ -106,6 +115,9 @@ async fn run_default(cli: Cli) -> Result<()> {
         trusted,
         resume,
         plan: cli.plan,
+        mode: cli.mode,
+        workflow: cli.workflow.as_deref().map(parse_workflow),
+        direct_lead,
         max_turns: cli.max_turns,
         system_prompt: cli.system_prompt,
         append_system_prompt: cli.append_system_prompt,
@@ -118,6 +130,272 @@ async fn run_default(cli: Cli) -> Result<()> {
         session_id: cli.session_id,
     };
     crate::headless::run(options).await
+}
+
+fn skills_command(action: SkillAction) -> Result<()> {
+    let cwd = canonicalize_lenient(&std::env::current_dir()?);
+    let trusted = TrustStore::load()
+        .map(|store| store.is_trusted(&cwd))
+        .unwrap_or(false);
+    let config = Config::load_with_trust(&cwd, trusted)?;
+    let registry = SkillRegistry::discover(&config, &cwd, trusted);
+    match action {
+        SkillAction::List { role, mode } => {
+            let mut skills: Vec<_> = registry.list().iter().collect();
+            if let (Some(role), Some(mode)) = (role.as_deref(), mode.as_deref()) {
+                skills.retain(|skill| skill.applies_to(role, mode));
+            } else if let Some(role) = role.as_deref() {
+                skills.retain(|skill| {
+                    skill.metadata.agents.is_empty()
+                        || skill
+                            .metadata
+                            .agents
+                            .iter()
+                            .any(|agent| agent.eq_ignore_ascii_case(role))
+                });
+            } else if let Some(mode) = mode.as_deref() {
+                skills.retain(|skill| {
+                    skill.metadata.modes.is_empty()
+                        || skill
+                            .metadata
+                            .modes
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(mode))
+                });
+            }
+            if skills.is_empty() {
+                println!("No matching skills.");
+                return Ok(());
+            }
+            for skill in skills {
+                println!(
+                    "{:<34} {:<20} {:<9} {}",
+                    skill.metadata.name,
+                    skill.source.label(),
+                    if config.skills.enabled_for(&skill.metadata.name) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    skill.metadata.description
+                );
+            }
+        }
+        SkillAction::Inspect { name } => {
+            let Some(skill) = registry.get(&name) else {
+                bail!("unknown skill `{name}`");
+            };
+            println!("name: {}", skill.metadata.name);
+            println!("source: {}", skill.source.label());
+            println!("description: {}", skill.metadata.description);
+            println!("agents: {}", skill.metadata.agents.join(", "));
+            println!("modes: {}", skill.metadata.modes.join(", "));
+            println!("hash: {}", skill.content_hash);
+            println!("\n{}", skill.body);
+        }
+        SkillAction::Enable { name } => set_skill_enabled(&name, true)?,
+        SkillAction::Disable { name } => set_skill_enabled(&name, false)?,
+    }
+    Ok(())
+}
+
+fn set_skill_enabled(name: &str, enabled: bool) -> Result<()> {
+    let path = global_config_path();
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let root_table = root
+        .as_table_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("config is not a TOML table"))?;
+    let skills = root_table
+        .entry("skills")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let skills = skills
+        .as_table_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("[skills] is not a table"))?;
+    let disabled = skills
+        .entry("disabled")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let disabled = disabled
+        .as_array_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("skills.disabled is not an array"))?;
+    disabled.retain(|value| value.as_str() != Some(name));
+    if !enabled {
+        disabled.push(toml::Value::String(name.into()));
+    }
+    let overrides = skills
+        .entry("enabled_overrides")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let overrides = overrides
+        .as_array_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("skills.enabled_overrides is not an array"))?;
+    overrides.retain(|value| value.as_str() != Some(name));
+    if enabled {
+        overrides.push(toml::Value::String(name.into()));
+    }
+    let text = toml::to_string_pretty(&root)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&path, text.as_bytes())?;
+    println!(
+        "{} skill `{name}` in {}",
+        if enabled { "Enabled" } else { "Disabled" },
+        path.display()
+    );
+    Ok(())
+}
+
+async fn workflows_command(action: WorkflowAction) -> Result<()> {
+    let store = WorkflowStore::new()?;
+    match action {
+        WorkflowAction::List => {
+            println!("Presets:");
+            for preset in WorkflowPreset::ALL {
+                println!("  {}", preset.name());
+            }
+            let states = store.list()?;
+            if states.is_empty() {
+                println!("No saved workflow state.");
+            } else {
+                println!("Saved runs:");
+                for state in states {
+                    println!(
+                        "  {}  {:<12} {:<8} {:<10} session {}",
+                        state.id,
+                        state.kind.name(),
+                        state.stage.name(),
+                        state.mode,
+                        state.session_id
+                    );
+                }
+            }
+        }
+        WorkflowAction::Inspect { id } => {
+            if let Ok(state) = store.load(&id) {
+                println!("{}", state.render());
+                println!(
+                    "contract: {}",
+                    state.contract_id.as_deref().unwrap_or("none")
+                );
+                println!("evidence: {}", state.evidence_ids.join(", "));
+                if let Ok(dir) = kudelma_storage::workflows_dir() {
+                    let ledger_store = ArtifactStore::new(dir);
+                    if let Ok(ledger) = ledger_store
+                        .load::<kudelma_core::orchestration::ExecutionLedger>(&format!(
+                            "ledger-{}",
+                            state.id
+                        ))
+                    {
+                        println!(
+                            "cost: ${:.4} · tokens: {} · workers: {}/{} · accepted: {}",
+                            ledger.total_cost(),
+                            ledger.total_tokens(),
+                            ledger.workers_succeeded,
+                            ledger.workers_started,
+                            ledger.accepted
+                        );
+                    }
+                }
+            } else if let Some(preset) = WorkflowPreset::ALL
+                .iter()
+                .find(|preset| preset.name() == id)
+            {
+                println!("{} ({:?})", preset.name(), preset);
+            } else {
+                bail!("unknown workflow or saved id `{id}`");
+            }
+        }
+        WorkflowAction::Resume { id } => {
+            let state = store.load(&id)?;
+            let sessions = SessionStore::new()?;
+            let resume = sessions.load(&state.session_id)?;
+            let cwd = canonicalize_lenient(&PathBuf::from(&resume.meta.cwd));
+            let trusted = TrustStore::load()
+                .map(|store| store.is_trusted(&cwd))
+                .unwrap_or(false);
+            let config = Arc::new(Config::load_with_trust(&cwd, trusted)?);
+            let auth = AuthStore::load().ok();
+            let params = kudelma_tui::TuiParams {
+                cwd,
+                config,
+                model: Some(resume.meta.model.clone()),
+                auth,
+                yolo: false,
+                trusted,
+                plan: false,
+                mode: Some(state.mode.clone()),
+                workflow: None,
+                direct_lead: true,
+                max_turns: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                allowed_tools: None,
+                disallowed_tools: Vec::new(),
+                resume: Some(resume),
+                initial_prompt: None,
+            };
+            return kudelma_tui::run(params).await;
+        }
+    }
+    Ok(())
+}
+
+fn tasks_command(action: TaskAction) -> Result<()> {
+    let store = ArtifactStore::new(tasks_dir()?);
+    match action {
+        TaskAction::Inspect { id } => {
+            let candidates = [
+                id.clone(),
+                format!("task-{id}"),
+                format!("report-{id}"),
+                format!("exploration-{id}"),
+                format!("explorer-{id}"),
+            ];
+            for candidate in candidates {
+                if let Ok(value) = store.load::<serde_json::Value>(&candidate) {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok(());
+                }
+            }
+            bail!("no task, report or exploration artifact with id `{id}`");
+        }
+        TaskAction::History => {
+            let ids = store.list_ids()?;
+            if ids.is_empty() {
+                println!("No worker tasks or reports.");
+                return Ok(());
+            }
+            for id in ids {
+                if let Ok(value) = store.load::<serde_json::Value>(&id) {
+                    let summary = value["summary"]
+                        .as_str()
+                        .or_else(|| value["objective"].as_str())
+                        .or_else(|| value["status"].as_str())
+                        .unwrap_or("");
+                    println!(
+                        "{:<44} {}",
+                        id,
+                        summary.chars().take(80).collect::<String>()
+                    );
+                } else {
+                    println!("{id}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_workflow(raw: &str) -> WorkflowPreset {
+    match raw.to_ascii_lowercase().replace('-', "_").as_str() {
+        "feature" | "feature_development" => WorkflowPreset::Feature,
+        "bug" | "bug_fix" => WorkflowPreset::BugFix,
+        "refactor" | "refactoring" => WorkflowPreset::Refactor,
+        "simple" | "simple_task" => WorkflowPreset::Simple,
+        _ => WorkflowPreset::Adaptive,
+    }
 }
 
 async fn auth(action: AuthAction) -> Result<()> {
@@ -521,6 +799,61 @@ max_turns = 50
 compaction_percent = 80
 bash_timeout_secs = 120
 mcp_defer_threshold = 15
+
+# Independent role models. Leave unset to fall back to default_model.
+[agency]
+# provider = "openai"
+# model = "gpt-4.1-mini"
+max_turns = 10
+max_clarification_rounds = 8
+
+[lead]
+# provider = "anthropic"
+# model = "claude-sonnet-4-5"
+max_turns = 40
+max_children = 4
+
+[agents.coder]
+# provider = "openai"
+# model = "gpt-4.1"
+max_turns = 25
+
+# Shared read-only exploration is deterministic and has no model of its own.
+[exploration]
+enabled = true
+read_only = true
+prefer_deterministic_retrieval = true
+max_files = 30
+max_results = 100
+max_investigation_rounds = 5
+allow_external_fetch = true
+
+[workflow]
+default = "adaptive"          # adaptive | feature | bug_fix | refactor | simple
+require_review = true
+require_verification = true
+require_spec_approval = "risk_based"   # never | risk_based | always
+require_plan_approval = "risk_based"
+verification_commands = []    # e.g. ["cargo test --workspace", "cargo clippy -- -D warnings"]
+
+[workflow.execution]
+strategy = "adaptive"         # inline | subagent_driven | adaptive
+max_parallel_coders = 3
+fresh_coder_per_task = true
+review_after_each_task = true
+
+[skills]
+enabled = true
+lazy_loading = true
+project_skills_require_trust = true
+disabled = []
+
+[budgets]
+task_cost_usd = 0.0           # 0 disables the budget
+task_wall_clock_secs = 0
+# [budgets.role_cost_usd]
+# lead = 5.0
+# agency = 1.0
 
 [permissions]
 default = "prompt"        # allow | deny | prompt

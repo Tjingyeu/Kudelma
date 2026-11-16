@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use kudelma_core::orchestration::TaskContract;
+use kudelma_core::workflows::WorkflowState;
 use kudelma_core::{AgentEvent, PermissionAsk, SessionTimeline, TaskStatus, TurnEndReason};
 use kudelma_permissions::PermissionAnswer;
 use kudelma_providers::Model;
@@ -76,7 +78,10 @@ pub enum Effect {
     Background,
     Quit,
     Answer(String, PermissionAnswer),
-    ToggleMode,
+    SetMode(String),
+    ApproveContract(Option<String>),
+    Verify(String),
+    SwitchToAgency,
     Compact,
     NewSession {
         resume: Option<String>,
@@ -93,7 +98,18 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "Browse saved sessions"),
     ("/resume <id>", "Resume a session by id"),
     ("/model [spec]", "List or switch models"),
-    ("/mode", "Toggle build / plan mode"),
+    ("/mode", "Switch Lead mode: plan, build, debug, review"),
+    (
+        "/contract",
+        "Show the task contract; /contract approve to approve",
+    ),
+    ("/workflow", "Show workflow stage, gates and evidence"),
+    (
+        "/skills",
+        "List skills applicable to the current role and mode",
+    ),
+    ("/verify", "Run a deterministic verification command"),
+    ("/agency", "Return to Agency for a new or revised request"),
     ("/compact", "Summarize and compact context"),
     ("/usage", "Show token and cost usage"),
     ("/tasks", "Show subagents and background tasks"),
@@ -112,6 +128,10 @@ pub struct App {
     pub(crate) meta: SessionMeta,
     pub(crate) model_spec: String,
     pub(crate) mode_name: String,
+    pub(crate) role: String,
+    pub(crate) contract: Option<TaskContract>,
+    pub(crate) workflow: Option<WorkflowState>,
+    pub(crate) skills: Option<std::sync::Arc<kudelma_core::skills::SkillRegistry>>,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u32,
     pub(crate) total_cost: f64,
@@ -155,6 +175,10 @@ impl App {
             busy: false,
             model_spec: meta.model.clone(),
             mode_name: meta.mode.clone(),
+            role: meta.active_role.clone(),
+            contract: None,
+            workflow: None,
+            skills: None,
             context_tokens: 0,
             context_window: 0,
             total_cost: meta.cost_usd,
@@ -197,6 +221,10 @@ impl App {
         self.scroll = 0;
         self.model_spec = meta.model.clone();
         self.mode_name = meta.mode.clone();
+        self.role = meta.active_role.clone();
+        self.contract = None;
+        self.workflow = None;
+        self.skills = None;
         self.total_cost = meta.cost_usd;
         self.input_tokens = meta.input_tokens;
         self.output_tokens = meta.output_tokens;
@@ -379,6 +407,45 @@ impl App {
                     ));
                 }
             }
+            AgentEvent::RoleChanged { role, model } => {
+                self.role = role.clone();
+                self.notice = Some(format!("{role} · {model}"));
+                self.blocks
+                    .push(Block::Info(format!("role: {role} ({model})")));
+            }
+            AgentEvent::ModeChanged { from, to, reason } => {
+                self.mode_name = to.clone();
+                self.notice = Some(format!("{from} -> {to}: {reason}"));
+                self.blocks
+                    .push(Block::Info(format!("mode: {from} -> {to} ({reason})")));
+            }
+            AgentEvent::ContractUpdated(contract) => {
+                self.notice = Some(format!(
+                    "contract v{}: {}",
+                    contract.contract_version,
+                    contract.status.name()
+                ));
+                self.contract = Some(contract);
+            }
+            AgentEvent::WorkflowUpdated(workflow) => {
+                self.workflow = Some(workflow);
+            }
+            AgentEvent::Verification(evidence) => {
+                self.notice = Some(format!(
+                    "verify {}: {}",
+                    evidence.result.name(),
+                    evidence.command
+                ));
+                self.blocks.push(Block::Info(format!(
+                    "verify [{}] {} {}",
+                    evidence.result.name(),
+                    evidence.command,
+                    evidence
+                        .exit_code
+                        .map(|code| format!("exit {code}"))
+                        .unwrap_or_default()
+                )));
+            }
             AgentEvent::TimelineReset(timeline) => {
                 self.blocks.clear();
                 self.apply_timeline(&timeline);
@@ -389,6 +456,7 @@ impl App {
                 self.meta = meta.clone();
                 self.model_spec = meta.model.clone();
                 self.mode_name = meta.mode.clone();
+                self.role = meta.active_role.clone();
                 self.total_cost = meta.cost_usd;
                 if let Some(Block::Assistant { streaming, .. }) = self.blocks.last_mut() {
                     *streaming = false;
@@ -666,7 +734,73 @@ impl App {
                 self.open_models();
                 vec![]
             }
-            "mode" => vec![Effect::ToggleMode],
+            "mode" => vec![Effect::SetMode(if argument.is_empty() {
+                next_mode(&self.mode_name).to_string()
+            } else {
+                argument.to_ascii_lowercase()
+            })],
+            "contract" => {
+                if argument == "approve" {
+                    let id = self
+                        .contract
+                        .as_ref()
+                        .map(|contract| contract.contract_id.clone());
+                    vec![Effect::ApproveContract(id)]
+                } else if let Some(contract) = &self.contract {
+                    self.blocks.push(Block::Info(contract.render()));
+                    vec![]
+                } else {
+                    self.blocks
+                        .push(Block::Info("No task contract yet.".into()));
+                    vec![]
+                }
+            }
+            "workflow" => {
+                if let Some(workflow) = &self.workflow {
+                    self.blocks.push(Block::Info(workflow.render()));
+                } else {
+                    self.blocks
+                        .push(Block::Info("No workflow state yet.".into()));
+                }
+                vec![]
+            }
+            "skills" => {
+                if let Some(skills) = &self.skills {
+                    let applicable = skills.applicable(&self.role, &self.mode_name);
+                    if applicable.is_empty() {
+                        self.blocks
+                            .push(Block::Info("No applicable skills.".into()));
+                    } else {
+                        self.blocks.push(Block::Info(format!(
+                            "Skills for {} / {}:",
+                            self.role, self.mode_name
+                        )));
+                        for skill in applicable {
+                            self.blocks.push(Block::Info(format!(
+                                "  {} [{}]: {}",
+                                skill.metadata.name,
+                                skill.source.label(),
+                                skill.metadata.description
+                            )));
+                        }
+                    }
+                } else {
+                    self.blocks.push(Block::Info(
+                        "Skill registry is not available in this session.".into(),
+                    ));
+                }
+                vec![]
+            }
+            "verify" => {
+                if argument.is_empty() {
+                    self.blocks
+                        .push(Block::Info("usage: /verify <command>".into()));
+                    vec![]
+                } else {
+                    vec![Effect::Verify(argument.to_string())]
+                }
+            }
+            "agency" => vec![Effect::SwitchToAgency],
             "compact" => vec![Effect::Compact],
             "usage" => {
                 self.blocks.push(Block::Info(format!(
@@ -1213,4 +1347,13 @@ fn next_boundary(text: &str, index: usize) -> usize {
         .nth(1)
         .map(|(i, _)| index + i)
         .unwrap_or(text.len())
+}
+
+fn next_mode(current: &str) -> &'static str {
+    match current {
+        "build" => "plan",
+        "plan" => "debug",
+        "debug" => "review",
+        _ => "build",
+    }
 }

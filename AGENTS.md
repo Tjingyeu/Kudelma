@@ -20,15 +20,25 @@ cargo build --release
 - `crates/kudelma-providers` — Anthropic / OpenAI-compatible / Gemini streaming clients.
 - `crates/kudelma-permissions` — permission decisions, Tree-sitter bash scopes, path boundaries.
 - `crates/kudelma-tools` — `WorkspaceEnv` plus built-in tools (`index`, `read`, `edit`, `bash`, ...).
-- `crates/kudelma-core` — agent loop, sessions, compaction, subagents, MCP, hooks.
-- `crates/kudelma-tui` — ratatui interface.
+- `crates/kudelma-core` — orchestration: Agency/Lead/Coder, shared deterministic exploration,
+  Lead modes, Task Contracts, Context Packs, Skills, Workflows, Verifier, MCP, hooks.
+- `crates/kudelma-tui` — ratatui interface with role/mode/gate, contract and skill visibility.
 - `crates/kudelma-acp` — ACP stdio server.
 - `src/` — CLI commands and headless mode.
 
 ## Invariants
 
-- Conversation history is append-only; do not rewrite earlier messages except at
-  an explicit compaction/rewind boundary. Tool-use blocks must always be closed.
+- There are three LLM roles: Agency (intent/routing), Lead (technical authority), Coder
+  (scoped implementation). Verifier is deterministic.
+- Exploration is a shared read-only capability (`crates/kudelma-core/src/exploration/`), not
+  an agent and never a model call. Agency and Lead interpret its evidence with their own model.
+- PLAN/BUILD/DEBUG/REVIEW are modes of one Lead session, never separate agents.
+- Agency and Lead histories are separate; lead receives a Context Pack, not the Agency transcript.
+- Only Lead may dispatch Coder. Agency may invoke shared deterministic exploration read-only.
+- Skills and Workflows never grant permissions; `kudelma-permissions` remains the final authority.
+- Completion requires real `ExecutionEvidence`; code changes invalidate a passed verification gate.
+- Conversation history is append-only; do not rewrite earlier messages except at an
+  explicit compaction/rewind boundary. Tool-use blocks must always be closed.
 - Model-visible file access goes through `WorkspaceEnv`; host state uses `StateDir`.
 - Permissions are fail-closed. `deny` wins, untrusted projects cannot widen access,
   and shell redirections require exact approval. Never bypass `PermissionManager`

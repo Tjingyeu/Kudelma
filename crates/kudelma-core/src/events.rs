@@ -1,5 +1,8 @@
 use kudelma_storage::SessionMeta;
 
+use crate::orchestration::TaskContract;
+use crate::verification::ExecutionEvidence;
+use crate::workflows::WorkflowState;
 #[derive(Debug, Clone)]
 pub struct PermissionAsk {
     pub request_id: String,
@@ -32,6 +35,7 @@ pub enum TurnEndReason {
     Cancelled,
     Error,
     ContextFull,
+    Blocked,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +70,18 @@ pub enum AgentEvent {
         status: TaskStatus,
         detail: Option<String>,
     },
+    RoleChanged {
+        role: String,
+        model: String,
+    },
+    ModeChanged {
+        from: String,
+        to: String,
+        reason: String,
+    },
+    ContractUpdated(TaskContract),
+    WorkflowUpdated(WorkflowState),
+    Verification(ExecutionEvidence),
     TimelineReset(Vec<crate::session::SessionTimeline>),
     TurnDone {
         reason: TurnEndReason,

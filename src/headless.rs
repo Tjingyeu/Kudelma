@@ -24,6 +24,9 @@ pub struct HeadlessOptions {
     pub trusted: bool,
     pub resume: Option<StoredSession>,
     pub plan: bool,
+    pub mode: Option<String>,
+    pub workflow: Option<kudelma_config::WorkflowPreset>,
+    pub direct_lead: bool,
     pub max_turns: Option<u32>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -76,6 +79,10 @@ pub async fn run(options: HeadlessOptions) -> Result<()> {
         resume: options.resume.clone(),
         session_id: options.session_id.clone(),
         plan: options.plan,
+        mode: options.mode.clone(),
+        workflow: options.workflow,
+        direct_lead: options.direct_lead,
+        auto_approve_contracts: true,
         max_turns: options.max_turns,
         system_prompt: options.system_prompt.clone(),
         append_system_prompt: options.append_system_prompt.clone(),
@@ -292,6 +299,76 @@ async fn run_turn(
                 );
             }
             AgentEvent::TaskUpdate { .. } => {}
+            AgentEvent::RoleChanged { role, model } => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({ "type": "role_changed", "role": role, "model": model })
+                    );
+                } else if options.verbose {
+                    eprintln!("[role] {role} ({model})");
+                }
+            }
+            AgentEvent::ModeChanged { from, to, reason } => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({ "type": "mode_changed", "from": from, "to": to, "reason": reason })
+                    );
+                } else if options.verbose {
+                    eprintln!("[mode] {from} -> {to}: {reason}");
+                }
+            }
+            AgentEvent::ContractUpdated(contract) => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "contract",
+                            "id": contract.contract_id,
+                            "version": contract.contract_version,
+                            "status": contract.status.name(),
+                        })
+                    );
+                } else if options.verbose {
+                    eprintln!(
+                        "[contract] {} v{} {}",
+                        contract.contract_id,
+                        contract.contract_version,
+                        contract.status.name()
+                    );
+                }
+            }
+            AgentEvent::WorkflowUpdated(workflow) => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "workflow",
+                            "id": workflow.id,
+                            "kind": workflow.kind.name(),
+                            "stage": workflow.stage.name(),
+                            "mode": workflow.mode,
+                        })
+                    );
+                }
+            }
+            AgentEvent::Verification(evidence) => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "verification",
+                            "id": evidence.id,
+                            "result": evidence.result.name(),
+                            "command": evidence.command,
+                            "exit_code": evidence.exit_code,
+                        })
+                    );
+                } else if options.verbose {
+                    eprintln!("[verify {}] {}", evidence.result.name(), evidence.command);
+                }
+            }
             AgentEvent::TimelineReset(_) => {}
             AgentEvent::TurnDone { reason, .. } => {
                 if options.output == OutputFormat::Text && !text.is_empty() {
@@ -317,7 +394,7 @@ fn finish(options: &HeadlessOptions, handle: &SessionHandle, result: &TurnResult
     }
     if matches!(
         result.reason,
-        TurnEndReason::Error | TurnEndReason::ContextFull
+        TurnEndReason::Error | TurnEndReason::ContextFull | TurnEndReason::Blocked
     ) {
         bail!("agent turn failed");
     }
@@ -338,7 +415,7 @@ fn print_result(
             TurnEndReason::Completed => "success",
             TurnEndReason::Cancelled => "cancelled",
             TurnEndReason::MaxSteps => "max_turns",
-            TurnEndReason::Error | TurnEndReason::ContextFull => "error",
+            TurnEndReason::Error | TurnEndReason::ContextFull | TurnEndReason::Blocked => "error",
         },
         "result": result.text,
         "session_id": handle.id,
@@ -349,7 +426,7 @@ fn print_result(
             "context_window": result.context_window,
         },
         "total_cost_usd": (result.cost_usd * 1_000_000.0).round() / 1_000_000.0,
-        "is_error": matches!(result.reason, TurnEndReason::Error | TurnEndReason::ContextFull),
+        "is_error": matches!(result.reason, TurnEndReason::Error | TurnEndReason::ContextFull | TurnEndReason::Blocked),
     });
     println!("{value}");
     let _ = std::io::stdout().flush();

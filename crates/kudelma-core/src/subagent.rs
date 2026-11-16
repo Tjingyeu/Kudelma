@@ -4,11 +4,11 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use kudelma_config::{Config, ModelTier, ToolKey};
-use kudelma_permissions::PermissionManager;
+use kudelma_permissions::{AgentRole, CoderScope, PermissionManager};
 use kudelma_providers::{
     ChatRequest, ContentBlock, Message, Model, ProviderEvent, all_models, provider_for,
 };
-use kudelma_storage::AuthStore;
+use kudelma_storage::{ArtifactStore, AuthStore, tasks_dir};
 use kudelma_tools::{
     TodoItem, Tool, ToolContext, ToolError, ToolOutput, ToolPermission, ToolRegistry,
     builtin_tools, object_schema,
@@ -18,6 +18,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::approver::Approver;
 use crate::events::{AgentEvent, TaskStatus};
+use crate::orchestration::{WorkerReport, WorkerStatus, WorkerTask};
+use crate::runtime::RuntimeState;
 use crate::tool_exec::{ToolRun, execute_call};
 
 pub struct TaskState {
@@ -35,6 +37,9 @@ pub struct TaskState {
     pub todos: Arc<RwLock<Vec<TodoItem>>>,
     pub allowed_tools: Option<std::collections::HashSet<String>>,
     pub disallowed_tools: std::collections::HashSet<String>,
+    pub trusted: bool,
+    pub yolo: bool,
+    pub runtime: Arc<RuntimeState>,
 }
 
 pub struct TaskTool {
@@ -54,16 +59,18 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate work to a subagent with its own context. Types: explore (read-only search), plan (read-only architecture plan), coder (implement a focused change). Only the final summary comes back."
+        "Delegate bounded implementation to a Coder with its own context. Only the final Worker Report comes back. Use `explore_codebase`, `index`, `grep` or `read` for read-only investigation."
     }
 
     fn schema(&self) -> Value {
         object_schema(
             json!({
                 "description": { "type": "string", "description": "Short label shown in the task list" },
-                "prompt": { "type": "string", "description": "Complete, self-contained instructions for the subagent" },
-                "subagent_type": { "type": "string", "enum": ["explore", "plan", "coder"], "description": "Default coder" },
-                "model": { "type": "string", "enum": ["weak", "medium", "strong"], "description": "Optional model tier" }
+                "prompt": { "type": "string", "description": "Complete, self-contained implementation instructions for the Coder" },
+                "subagent_type": { "type": "string", "enum": ["coder"], "description": "Only coder is supported" },
+                "model": { "type": "string", "enum": ["weak", "medium", "strong"], "description": "Optional model tier" },
+                "allowed_paths": { "type": "array", "items": { "type": "string" }, "description": "Coder write scope" },
+                "forbidden_paths": { "type": "array", "items": { "type": "string" }, "description": "Paths the coder must not modify" }
             }),
             &["description", "prompt"],
         )
@@ -110,6 +117,23 @@ impl Tool for TaskTool {
             .and_then(Value::as_str)
             .unwrap_or("coder")
             .to_string();
+        if kind == "plan" {
+            return Err(ToolError::InvalidArgs(
+                "the plan subagent was retired; use the lead_mode tool with mode=plan instead"
+                    .into(),
+            ));
+        }
+        if kind == "explore" {
+            return Err(ToolError::InvalidArgs(
+                "the standalone explore subagent was retired in the three-model architecture; use the `explore_codebase` tool for shared deterministic read-only exploration, or `index`/`grep`/`read` directly"
+                    .into(),
+            ));
+        }
+        if kind != "coder" {
+            return Err(ToolError::InvalidArgs(format!(
+                "unknown subagent_type `{kind}`; only coder is supported"
+            )));
+        }
         let tier = args
             .get("model")
             .and_then(Value::as_str)
@@ -121,6 +145,28 @@ impl Tool for TaskTool {
             });
         let task_id = uuid::Uuid::new_v4().to_string();
         let label = format!("{kind}: {description}");
+        state.runtime.begin_worker().map_err(ToolError::Other)?;
+        let task_store =
+            ArtifactStore::new(tasks_dir().map_err(|error| ToolError::Other(error.to_string()))?);
+        let mut worker_task = WorkerTask::new(
+            state
+                .runtime
+                .contract()
+                .map(|contract| contract.contract_id)
+                .unwrap_or_else(|| "none".into()),
+            prompt.clone(),
+        );
+        worker_task.task_id = task_id.clone();
+        worker_task.requirements.push(description.clone());
+        worker_task.allowed_paths = string_paths(&args, "allowed_paths", &state.cwd)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        worker_task.forbidden_paths = string_paths(&args, "forbidden_paths", &state.cwd)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let _ = task_store.save(&format!("task-{task_id}"), &worker_task);
         let _ = state.events.send(AgentEvent::TaskUpdate {
             id: task_id.clone(),
             label: label.clone(),
@@ -128,74 +174,173 @@ impl Tool for TaskTool {
             detail: None,
         });
 
-        let model = select_model(state, tier);
-        let registry = registry_for(&kind, state.allowed_tools.as_ref(), &state.disallowed_tools);
-        let system = crate::prompt::build_subagent_prompt(&state.cwd, &kind);
-        let result = run_loop(state, model, &registry, system, prompt, ctx, &label).await;
+        let current = state
+            .model
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let base = state
+            .runtime
+            .model_for("coder", &current)
+            .unwrap_or(current);
+        let model = select_model(state, &base, tier);
+        let registry = registry_for(state.allowed_tools.as_ref(), &state.disallowed_tools);
+        let system = format!(
+            "{}\n{}",
+            crate::prompt::build_subagent_prompt(&state.cwd),
+            state.runtime.skills.prompt_section("coder", "build")
+        );
+        let allowed_paths = string_paths(&args, "allowed_paths", &state.cwd);
+        let allowed_paths = if allowed_paths.is_empty() {
+            vec![state.cwd.clone()]
+        } else {
+            allowed_paths
+        };
+        let scope = CoderScope {
+            allowed_paths,
+            forbidden_paths: string_paths(&args, "forbidden_paths", &state.cwd),
+        };
+        let role = AgentRole::Coder;
+        let permissions =
+            PermissionManager::new(&state.config, &state.cwd, state.trusted, state.yolo)
+                .for_role(role, scope);
+        registry.register(Arc::new(crate::runtime_tools::SkillTool {
+            runtime: state.runtime.clone(),
+            role,
+        }));
+        let result = run_loop(
+            state,
+            model,
+            &registry,
+            &permissions,
+            "coder",
+            system,
+            prompt,
+            ctx,
+            &label,
+        )
+        .await;
 
         match result {
             Ok(summary) => {
+                state.runtime.invalidate_verification();
+                state.runtime.finish_worker(true);
+                let report = WorkerReport {
+                    task_id: task_id.clone(),
+                    status: WorkerStatus::Completed,
+                    summary: summary.clone(),
+                    modified_files: modified_files(&state.cwd).await,
+                    tests: Vec::new(),
+                    assumptions: Vec::new(),
+                    unresolved_issues: Vec::new(),
+                    evidence_refs: Vec::new(),
+                };
+                let _ = task_store.save(&format!("report-{task_id}"), &report);
                 let _ = state.events.send(AgentEvent::TaskUpdate {
-                    id: task_id,
+                    id: task_id.clone(),
                     label,
                     status: TaskStatus::Done,
                     detail: Some(summary.chars().take(200).collect()),
                 });
-                Ok(ToolOutput::success(summary))
+                Ok(ToolOutput::success(format!(
+                    "{summary}\n\n[task id: {task_id}]"
+                )))
             }
             Err(error) => {
+                state.runtime.finish_worker(false);
+                let report = WorkerReport {
+                    task_id: task_id.clone(),
+                    status: WorkerStatus::Failed,
+                    summary: error.clone(),
+                    modified_files: modified_files(&state.cwd).await,
+                    tests: Vec::new(),
+                    assumptions: Vec::new(),
+                    unresolved_issues: vec![error.clone()],
+                    evidence_refs: Vec::new(),
+                };
+                let _ = task_store.save(&format!("report-{task_id}"), &report);
                 let _ = state.events.send(AgentEvent::TaskUpdate {
-                    id: task_id,
+                    id: task_id.clone(),
                     label,
                     status: TaskStatus::Failed,
                     detail: Some(error.clone()),
                 });
-                Ok(ToolOutput::error(error))
+                Ok(ToolOutput::error(format!(
+                    "{error}\n\n[task id: {task_id}]"
+                )))
             }
         }
     }
 }
 
-fn select_model(state: &TaskState, tier: Option<ModelTier>) -> Model {
-    let current = state
-        .model
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+async fn modified_files(cwd: &std::path::Path) -> Vec<String> {
+    tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line[3.min(line.len())..].trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_paths(args: &Value, key: &str, base: &std::path::Path) -> Vec<PathBuf> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|path| {
+                    let path = PathBuf::from(path);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        base.join(path)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn select_model(state: &TaskState, current: &Model, tier: Option<ModelTier>) -> Model {
     let Some(tier) = tier else {
-        return current;
+        return current.clone();
     };
     all_models(&state.config, state.auth.as_ref())
         .into_iter()
         .find(|model| {
             model.provider == current.provider && model.tier == tier && model.supports_tools
         })
-        .unwrap_or(current)
+        .unwrap_or_else(|| current.clone())
 }
 
 fn registry_for(
-    kind: &str,
     allowed: Option<&std::collections::HashSet<String>>,
     disallowed: &std::collections::HashSet<String>,
 ) -> ToolRegistry {
     let registry = ToolRegistry::new();
-    let permitted: &[&str] = if kind == "coder" {
-        &[
-            "read",
-            "write",
-            "edit",
-            "glob",
-            "grep",
-            "ls",
-            "index",
-            "bash",
-            "todo_write",
-            "memory",
-            "webfetch",
-        ]
-    } else {
-        &["read", "glob", "grep", "ls", "index", "webfetch"]
-    };
+    let permitted: &[&str] = &[
+        "read",
+        "write",
+        "edit",
+        "glob",
+        "grep",
+        "ls",
+        "index",
+        "bash",
+        "todo_write",
+        "memory",
+        "webfetch",
+    ];
     for tool in builtin_tools() {
         if !permitted.contains(&tool.name()) || disallowed.contains(tool.name()) {
             continue;
@@ -215,6 +360,8 @@ async fn run_loop(
     state: &Arc<TaskState>,
     model: Model,
     registry: &ToolRegistry,
+    permissions: &PermissionManager,
+    role: &str,
     system: String,
     prompt: String,
     parent_ctx: &ToolContext,
@@ -244,13 +391,21 @@ async fn run_loop(
         let task = tokio::spawn(async move { provider.stream(request, tx, cancel).await });
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        let mut usage = kudelma_providers::TokenUsage::default();
         while let Some(event) = rx.recv().await {
             match event {
                 ProviderEvent::TextDelta(delta) => text.push_str(&delta),
                 ProviderEvent::ToolUse(call) => tool_calls.push(call),
-                _ => {}
+                ProviderEvent::Usage(value) => usage = value,
+                ProviderEvent::ThinkingDelta(_) => {}
             }
         }
+        state.runtime.record_turn(
+            role,
+            usage.input_tokens,
+            usage.output_tokens,
+            model.cost(usage),
+        );
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -300,7 +455,7 @@ async fn run_loop(
             let result = execute_call(
                 ToolRun {
                     registry,
-                    permissions: &state.permissions,
+                    permissions,
                     approver: state.approver.as_ref(),
                     ctx: &ctx,
                     events: &state.events,

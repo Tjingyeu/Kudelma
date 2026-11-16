@@ -267,6 +267,10 @@ async fn session_new(state: &State, params: &Value) -> Result<Value, String> {
         resume: None,
         session_id: None,
         plan: false,
+        mode: None,
+        workflow: None,
+        direct_lead: false,
+        auto_approve_contracts: true,
         max_turns: None,
         system_prompt: None,
         append_system_prompt: None,
@@ -284,6 +288,11 @@ async fn session_new(state: &State, params: &Value) -> Result<Value, String> {
         control,
         timeline: _,
         runner,
+        role: _,
+        lead_mode: _,
+        contract: _,
+        workflow: _,
+        skills: _,
     } = handle;
     *approver
         .session_id
@@ -364,7 +373,7 @@ fn stop_reason(reason: TurnEndReason) -> &'static str {
         TurnEndReason::Completed => "end_turn",
         TurnEndReason::Cancelled => "cancelled",
         TurnEndReason::MaxSteps => "max_turn_requests",
-        TurnEndReason::Error | TurnEndReason::ContextFull => "refusal",
+        TurnEndReason::Error | TurnEndReason::ContextFull | TurnEndReason::Blocked => "refusal",
     }
 }
 
@@ -434,6 +443,26 @@ fn forward_event(
         })),
         AgentEvent::PermissionRequest(_) => None,
         AgentEvent::TimelineReset(_) => None,
+        AgentEvent::RoleChanged { role, model } => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[role] {role} ({model})\n") }
+        })),
+        AgentEvent::ModeChanged { from, to, reason } => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[mode] {from} -> {to}: {reason}\n") }
+        })),
+        AgentEvent::ContractUpdated(contract) => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[contract {} v{}] {}\n", contract.contract_id, contract.contract_version, contract.status.name()) }
+        })),
+        AgentEvent::WorkflowUpdated(workflow) => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[workflow] {} · {}\n", workflow.kind.name(), workflow.stage.name()) }
+        })),
+        AgentEvent::Verification(evidence) => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[verify {}] {}\n", evidence.result.name(), evidence.command) }
+        })),
         AgentEvent::TurnDone { reason, .. } => {
             let sender = completions
                 .lock()

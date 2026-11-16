@@ -15,7 +15,7 @@ pub use bash::BashTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
-pub use index::IndexTool;
+pub use index::{IndexTool, SourceOutline, SymbolOutline, outline_source, supports_source};
 pub use ls::LsTool;
 pub use memory::MemoryTool;
 pub use read::ReadTool;

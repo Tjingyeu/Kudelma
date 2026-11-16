@@ -1,5 +1,10 @@
 # Kudelma 构建计划与架构设计文档 (Build & Architecture Plan)
 
+> **Note:** This document describes the initial v0.1 foundation. The implemented
+> four-role / Skills / Workflow architecture follows
+> [`docs/architecture/KUDELMA_AGENT_WORKFLOW_SPEC.md`](docs/architecture/KUDELMA_AGENT_WORKFLOW_SPEC.md)
+> and [`docs/architecture/IMPLEMENTATION.md`](docs/architecture/IMPLEMENTATION.md).
+
 > **Kudelma** 是一款基于 **Rust** 构建的高性能、低 Token 消耗、安全可扩展的终端 AI 编程智能体（AI Coding Agent CLI / TUI）。
 > 本计划深度参考并融合了 [**tontinton/maki**](https://github.com/tontinton/maki)、[**anomalyco/opencode**](https://github.com/anomalyco/opencode) 与 [**MoonshotAI/kimi-code**](https://github.com/MoonshotAI/kimi-code) 三大项目的核心架构设计。
 
@@ -63,7 +68,7 @@
      - **Host 层 (`StateDir`)**：仅用于宿主本机的会话存储、凭据管理、日志与全局配置，绝不与工作区文件系统混用。
   2. **L1-L4 Transcript 增量流式视图架构**：
      - 将会话输出抽象为 `Turn -> Block -> Delta` 三级增量操作流，使 TUI、Headless `stream-json` 与 ACP 协议共享同一套无 UI 框架耦合的渲染状态机。
-  3. **多角色专用子 Agent (`coder` / `explore` / `plan`)** 与 **生命周期 Hooks**：支持在工具调用前后 (`PreToolUse` / `PostToolUse`) 及会话结束 (`SessionEnd`) 挂载本地拦截/审计命令。
+  3. **专用实现子 Agent (`coder`)** 与 **生命周期 Hooks**：支持在工具调用前后 (`PreToolUse` / `PostToolUse`) 及会话结束 (`SessionEnd`) 挂载本地拦截/审计命令。原 `explore` / `plan` 子 Agent 已在 v1.1 架构中分别收敛为共享确定性探索能力与 Lead 模式。
   4. **原生 ACP (`Agent Client Protocol`) 支持**：通过 `kudelma acp` 提供 stdio NDJSON 服务，直接嵌入 Zed、JetBrains、VS Code 等现代 IDE。
 
 ---
@@ -163,7 +168,7 @@ Kudelma/
     │       ├── scope.rs             # AppScope -> SessionScope -> AgentScope 生命周期管理
     │       ├── loop_runner.rs       # run_turns 核心步进循环、Steer 抢占、悬空工具修复
     │       ├── compaction.rs        # 自动/手动上下文压缩与 Frame 切换
-    │       ├── subagent.rs          # `task` 工具实现 (explore / plan / coder 子 Agent 派生)
+    │       ├── subagent.rs          # `task` 工具实现（仅 Coder 子 Agent；共享探索见 exploration/）
     │       ├── transcript.rs        # L1-L4 增量 Transcript 状态流 (Turn/Block/Delta)
     │       ├── mcp.rs               # MCP 客户端 (stdio/SSE) 与 `tool_search` 延迟激活器
     │       ├── instructions.rs      # AGENTS.md / CLAUDE.md 层级发现与按需注入
@@ -255,7 +260,7 @@ Kudelma/
 | **`glob`** | `FsRead` | 基于 `ignore::WalkBuilder` 遍历工作区，自动忽略 `.git` 与 `.gitignore` 规则，按修改时间或路径相关性排序并截断上限（默认 100 条）。 |
 | **`grep`** | `FsRead` | 基于 `grep-regex` + `grep-searcher` 高速搜索，按文件分组聚合匹配行号与预览，限制单行最大长度防 Minified JS 撑爆上下文。 |
 | **`bash`** | `Run` | 在独立进程组（Unix `process_group(0)`）中启动 Shell；超时或取消时向整个进程组发送 `SIGTERM -> SIGKILL`；输出超过阈值（如 50KB / 2000 行）时**保留前 40% + 后 60%**，并将完整输出落盘至会话日志目录供 `read` 查阅；支持 `background: true` 异步执行。 |
-| **`task`** | `Agent` | 派生独立上下文的子 Agent（`explore` 只读探索、`plan` 架构规划、`coder` 编码实现），可选 `weak / medium / strong` 模型档位；主会话仅接收子 Agent 最终汇总报告。 |
+| **`task`** | `Agent` | 派生独立上下文的 Coder 子 Agent（仅 `coder`），可选 `weak / medium / strong` 模型档位；主会话仅接收子 Agent 最终汇总报告。只读探索请使用 `explore_codebase`。 |
 | **`todo_write`** | `SessionWrite` | 维护当前会话的结构化任务清单 (`pending` / `in_progress` / `completed`)，实时同步至 TUI 状态栏或侧边栏。 |
 | **`memory`** | `FsWrite` | 将项目规范、常见构建命令或用户偏好持久化至项目/全局记忆库，支持 `/memory` 管理。 |
 | **`webfetch`** | `Net` | 抓取指定 URL 并通过 `htmd` 转为清爽 Markdown；内置 DNS 解析后 IP 校验，默认拦截 `127.0.0.0/8`、`10.0.0.0/8`、`169.254.169.254`（云元数据端点）等私有地址以防御 SSRF（除非在 `net.allowed_private_hosts` 显式放行）。 |
@@ -393,7 +398,7 @@ kudelma [OPTIONS] [PROMPT] [COMMAND]
   - `run_turns` 异步 Agent 主循环，实现 `assert_append_only` 契约校验、悬空 `ToolUse` 自动闭合 (`close_dangling_tool_calls`)、用户 `Esc` 中断部分输出保留。
   - `AgentMode::Build` 与 `AgentMode::Plan(PathBuf)` 模式切换及 `ContextUpdate` 帧注入。
   - 上下文自动与手动压缩器 (`compaction.rs`)。
-  - `task` 子 Agent 调度器（支持 `explore` / `plan` / `coder` 三种预设角色与 `weak / medium / strong` 模型档位映射）及后台任务邮箱 (`SessionMailbox`)。
+  - `task` 子 Agent 调度器（仅 `coder` 角色与 `weak / medium / strong` 模型档位映射）及后台任务邮箱 (`SessionMailbox`)；共享只读探索由 `exploration/` 确定性执行器提供，不产生额外模型调用。
   - L1-L4 `Transcript` 增量事件流生成。
 - **里程碑验收**：端到端集成测试验证多轮工具调用、中途 `Steer` 插队、取消恢复、自动 Compaction 及子 Agent 摘要回传。
 

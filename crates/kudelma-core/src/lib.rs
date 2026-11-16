@@ -3,20 +3,30 @@
 //! Agent runtime: sessions, model turns, tool execution, compaction and MCP.
 
 pub mod agent;
+pub mod agents;
 pub mod approver;
 pub mod compact;
 pub mod events;
+pub mod exploration;
 pub mod hooks;
+pub mod lead;
 pub mod mcp;
+pub mod orchestration;
 pub mod prompt;
+pub mod runtime;
+pub mod runtime_tools;
 pub mod session;
+pub mod skills;
 pub mod subagent;
 pub mod tool_exec;
+pub mod verification;
+pub mod workflows;
 
-pub use agent::AgentMode;
+pub use agent::Agent;
 pub use approver::{Approver, AutoApprover, ChannelApprover};
 pub use events::{AgentEvent, PermissionAsk, TaskStatus, TurnEndReason};
 pub use kudelma_permissions::PermissionAnswer;
+pub use lead::{AgentMode, LeadMode};
 pub use session::{SessionHandle, SessionParams, SessionTimeline, spawn_session};
 
 use thiserror::Error;

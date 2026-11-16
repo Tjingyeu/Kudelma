@@ -6,8 +6,9 @@ pub mod builtin;
 pub mod env;
 
 pub use builtin::{
-    BashTool, EditTool, GlobTool, GrepTool, IndexTool, LsTool, MemoryTool, ReadTool, TodoWriteTool,
-    ToolSearchTool, WebfetchTool, WriteTool, builtin_tools,
+    BashTool, EditTool, GlobTool, GrepTool, IndexTool, LsTool, MemoryTool, ReadTool, SourceOutline,
+    SymbolOutline, TodoWriteTool, ToolSearchTool, WebfetchTool, WriteTool, builtin_tools,
+    outline_source, supports_source,
 };
 pub use env::{DirEntryInfo, LocalEnv, Meta, WorkspaceEnv};
 

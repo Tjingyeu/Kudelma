@@ -1,9 +1,15 @@
 //! Layered configuration for Kudelma.
 
 pub mod permissions;
+pub mod roles;
 
 pub use permissions::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolKeyParseError,
+};
+pub use roles::{
+    AgencyRoleConfig, ApprovalPolicy, BudgetsConfig, CoderRoleConfig, ExecutionStrategy,
+    ExplorationConfig, LeadRoleConfig, SkillsConfig, SpecialistAgentsConfig, WorkflowConfig,
+    WorkflowExecutionConfig, WorkflowPreset,
 };
 
 use std::collections::BTreeMap;
@@ -53,6 +59,13 @@ pub struct Config {
     pub default_model: String,
     pub ui: UiConfig,
     pub agent: AgentConfig,
+    pub agency: AgencyRoleConfig,
+    pub lead: LeadRoleConfig,
+    pub agents: SpecialistAgentsConfig,
+    pub exploration: ExplorationConfig,
+    pub workflow: WorkflowConfig,
+    pub skills: SkillsConfig,
+    pub budgets: BudgetsConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub permissions: PermissionsConfig,
     #[serde(skip)]
@@ -271,6 +284,27 @@ impl Config {
 
     pub fn system_prompt_extra(&self) -> Option<String> {
         None
+    }
+
+    pub fn role_model_spec(&self, role: &str) -> Option<String> {
+        let (provider, model) = match role {
+            "agency" => (&self.agency.provider, &self.agency.model),
+            "lead" => (&self.lead.provider, &self.lead.model),
+            "coder" => (&self.agents.coder.provider, &self.agents.coder.model),
+            _ => return None,
+        };
+        match (provider, model) {
+            (Some(provider), Some(model)) => {
+                if model.contains('/') {
+                    Some(model.clone())
+                } else {
+                    Some(format!("{provider}/{model}"))
+                }
+            }
+            (None, Some(model)) => Some(model.clone()),
+            (Some(_provider), None) => None,
+            (None, None) => None,
+        }
     }
 }
 

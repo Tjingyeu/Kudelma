@@ -34,6 +34,30 @@ pub fn plans_dir() -> Result<PathBuf, StorageError> {
     Ok(state_dir()?.join("plans"))
 }
 
+pub fn contracts_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("contracts"))
+}
+
+pub fn workflows_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("workflows"))
+}
+
+pub fn tasks_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("tasks"))
+}
+
+pub fn evidence_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("evidence"))
+}
+
+pub fn exploration_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("exploration"))
+}
+
+pub fn user_skills_dir() -> PathBuf {
+    config_dir().join("skills")
+}
+
 pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -52,6 +52,27 @@ pub struct Cli {
     #[arg(long)]
     pub trust: bool,
 
+    /// Start in a Lead mode: plan, build, debug or review
+    #[arg(long, value_parser = ["plan", "build", "debug", "review"])]
+    pub mode: Option<String>,
+
+    /// Workflow preset: adaptive, feature, bug_fix, refactor or simple
+    #[arg(long, value_parser = [
+        "adaptive",
+        "feature",
+        "feature-development",
+        "bug_fix",
+        "bug-fix",
+        "refactor",
+        "refactoring",
+        "simple"
+    ])]
+    pub workflow: Option<String>,
+
+    /// Skip Agency and send the prompt straight to Lead
+    #[arg(long)]
+    pub direct_lead: bool,
+
     /// Start in plan mode (read-only exploration and a plan file)
     #[arg(long)]
     pub plan: bool,
@@ -115,6 +136,21 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Inspect and manage skills
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+    /// Inspect workflows and saved workflow state
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+    /// Inspect worker tasks, reports and evidence
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Print the tree-sitter symbol outline of a file
     Index {
         #[arg(value_name = "FILE")]
@@ -175,6 +211,43 @@ pub enum SessionAction {
         /// File path; stdin when omitted or `-`
         file: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    /// List discovered skills
+    List {
+        /// Filter by role: agency, lead, coder
+        #[arg(long)]
+        role: Option<String>,
+        /// Filter by mode: plan, build, debug, review
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Print a skill's metadata and full instructions
+    Inspect { name: String },
+    /// Enable a skill in the global config
+    Enable { name: String },
+    /// Disable a skill in the global config
+    Disable { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkflowAction {
+    /// List workflow presets and saved workflow runs
+    List,
+    /// Inspect a saved workflow id or a preset name
+    Inspect { id: String },
+    /// Show how to resume the session attached to a workflow
+    Resume { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TaskAction {
+    /// Print a worker task, worker report, or exploration report
+    Inspect { id: String },
+    /// List saved worker tasks and reports
+    History,
 }
 
 #[derive(Subcommand, Debug)]

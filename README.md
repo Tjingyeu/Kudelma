@@ -1,12 +1,30 @@
 # Kudelma
 
-> 一款用 Rust 编写的高性能终端 AI 编程智能体（AI Coding Agent）。单二进制、快速启动、低 Token 消耗，并带有安全的多级权限、可恢复会话、子 Agent、MCP 与 ACP 集成。
+> 一款用 Rust 编写的高性能终端 AI 编程智能体（AI Coding Agent）。单二进制、快速启动、低 Token 消耗，并带有三模型协作、共享确定性探索、工程化 Skills/Workflow、确定性验证证据、安全权限、MCP 与 ACP 集成。
 
-Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)、[anomalyco/opencode](https://github.com/anomalyco/opencode) 与 [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code)，完整设计见 [`PLAN.md`](./PLAN.md)。
+Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)、[anomalyco/opencode](https://github.com/anomalyco/opencode) 与 [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code)，并实现了 [`KUDELMA_AGENT_WORKFLOW_SPEC.md`](docs/architecture/KUDELMA_AGENT_WORKFLOW_SPEC.md) 定义的角色与工作流架构。早期基础设计见 [`PLAN.md`](./PLAN.md)。
 
 ---
 
 ## 特性
+
+### 三模型协作（Agency / Lead / Coder）+ 共享确定性探索
+
+- **Agency**：面向开发者的意图代理。普通问题直接回答；代码问题调用共享只读 **Exploration Capability** 并返回带 `file:symbol:line` 的证据，**不唤醒 Lead、也不启动额外模型**；开发请求经过最小充分澄清后生成版本化 **Task Contract**。
+- **Lead**：唯一技术决策与编排权威，在同一会话内切换 **PLAN / BUILD / DEBUG / REVIEW** 四种模式，可内联实现或派遣 Coder；直接复用同一套确定性探索能力做深度调查。
+- **共享 Exploration Capability**：不是 Agent、没有独立模型或会话。确定性地组合文件发现、Tree-sitter 符号骨架、关键字/引用检索、源码片段、项目记忆与最近运行证据，返回区分 observed fact / inference 的 `ExplorationReport`；由调用方（Agency 或 Lead）用自身模型解释。
+- **Coder**：受限路径与工具的实现 Worker，不能派生子 Agent，返回结构化 Worker Report。
+- **Verifier**：非 LLM 确定性子系统。执行 build/test/lint/验收命令，记录命令、工作目录、退出码、起止时间、Git HEAD、diff 哈希与输出日志，生成不可由模型伪造的 `ExecutionEvidence`。
+
+### 工程工作流与 Skills
+
+- **Skills 引擎**：解析 `SKILL.md` Frontmatter，内置 12 个工程技能（intent-refinement、writing-plans、executing-plans、TDD、systematic-debugging、code review、verification 等）；按角色/模式匹配，**按需懒加载**，未信任项目 Skill 默认隔离。
+- **Workflows 与硬门禁**：Feature / Bug Fix / Refactoring / Simple Task / Codebase Question 工作流；Contract、Plan、Design、Review、Verification、Finish 等 Gate 由运行时检查，模型不能只靠文字宣称完成。
+- **Task Contract**：版本化、可审批、保留历史版本；未解决关键问题时不得标记为 approved。
+- **Context Pack**：Agency -> Lead、Lead -> Coder 传递最小任务上下文，不复制完整聊天历史，并区分 `confirmed fact` / `observed evidence` / `assumption` / `unknown`。
+- **Cost per Accepted Task**：Execution Ledger 记录每个角色的 Turn/Token/成本、加载的 Skill 哈希、Worker 成功率与返工次数；支持任务/角色成本与 wall-clock 预算。
+
+### 其他能力
 
 - **原生 Rust 单二进制**：无 Node.js / Bun 运行时，毫秒级启动；`ratatui` 交互式 TUI。
 - **多 Provider**：Anthropic Messages、OpenAI Chat Completions 兼容协议、Google Gemini。
@@ -19,20 +37,19 @@ Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)�
   - `todo_write`、`memory`、带 SSRF 防护的 `webfetch`。
 - **安全权限模型**：
   - `deny` 优先；工作区读与写默认允许，工作区外询问；`bash` 默认询问。
+  - 三模型能力矩阵由 Rust 权限层强制：Agency 只读，Coder 仅限授权路径，Lead 可编排但不能绕过 deny；`--yolo` 不绕过这些硬边界。
   - Tree-sitter 拆解复合 Shell 命令（`git status && rm -rf /` → 两个作用域），重定向/替换等高风险形式要求精确批准。
-  - Plan 模式只允许写计划文件，命令必须确认。
-  - 未信任目录只生效 `deny` 规则，不加载项目 MCP / hooks。
+  - Plan 模式只允许写计划文件；Review 模式默认只读并依赖 Verifier 证据。
+  - 未信任目录只生效 `deny` 规则，不加载项目 MCP / hooks / Skills。
 - **会话与上下文**：
+  - Agency 与 Lead 会话历史分轨持久化；恢复会话时保留角色、模式、契约和工作流状态。
   - 会话自动保存到 XDG state 目录，支持 `-c` / `-r` 恢复、导出/导入、跨进程锁。
   - 自动上下文压缩（阈值可配），超长工具输出首尾保留。
   - `Esc` 中断保留已生成内容；`Esc Esc` 回滚到历史 Prompt。
-- **Agent 编排**：
-  - `task` 子 Agent：`explore`（只读检索）、`plan`（只读规划）、`coder`（实现），支持 `weak` / `medium` / `strong` 模型档位。
-  - 后台任务完成通知，下一轮自动唤醒模型。
 - **MCP**：stdio 与 Streamable HTTP MCP 客户端；工具过多时通过 `tool_search` 延迟注入 Schema。
 - **ACP**：`kudelma acp` 提供 Agent Client Protocol stdio 服务，可在 Zed 等编辑器中直接使用。
 - **Headless / SDK**：
-  - `kudelma -p "..."` 单轮执行。
+  - `kudelma -p "..."` 单轮执行；默认走 Agency 路由，`--direct-lead` 可跳过。
   - `--output-format text|json|stream-json`。
   - `--input-format stream-json` 从 stdin 持续接收用户消息。
 
@@ -68,9 +85,21 @@ kudelma auth login anthropic
 # 查看可用模型与凭据状态
 kudelma models
 
-# 在当前项目启动 TUI
+# 在当前项目启动 TUI（默认先由 Agency 理解意图）
 cd your-project
 kudelma
+
+# 直接进入 Lead（高级用法）
+kudelma --direct-lead
+
+# 指定 Lead 初始模式 / 工作流
+kudelma --mode plan
+kudelma --workflow bug_fix
+
+# 查看 Skills 与工作流
+kudelma skill list
+kudelma workflow list
+kudelma task history
 
 # 指定模型
 kudelma -m moonshot/kimi-k2.5
@@ -88,8 +117,7 @@ kudelma -r <SESSION_ID>
 # 只读规划模式
 kudelma --plan
 ```
-
-> Headless 模式默认**拒绝**权限询问（避免无人值守时静默放行）。需要执行命令或写工作区外文件时加 `--yolo`，或用 `--allowed-tools` 精确放行。
+> Headless 模式默认**拒绝**权限询问（避免无人值守时静默放行）。需要执行命令或写工作区外文件时加 `--yolo`，或用 `--allowed-tools` 精确放行。Headless 会为自动化流程自动批准 Task Contract；TUI 中需用 `/contract approve` 确认高风险契约。
 
 ---
 
@@ -99,6 +127,8 @@ kudelma --plan
 项目配置：`<project>/.kudelma/config.toml`；项目权限：`<project>/.kudelma/permissions.toml`。
 
 `kudelma config init` 会生成模板。
+
+> 升级提示：v1.1 已移除 `[agents.explorer]` 模型配置；只读探索现在由 `[exploration]` 控制，确定性执行，不产生额外模型调用。
 
 ```toml
 default_model = "anthropic/claude-sonnet-4-5"
@@ -112,6 +142,49 @@ max_turns = 50
 compaction_percent = 80
 bash_timeout_secs = 120
 mcp_defer_threshold = 15
+
+[agency]
+max_turns = 10
+max_clarification_rounds = 8
+
+[lead]
+max_turns = 40
+max_children = 4
+
+[agents.coder]
+max_turns = 25
+
+# 共享只读探索：确定性检索，没有独立模型。
+[exploration]
+enabled = true
+read_only = true
+prefer_deterministic_retrieval = true
+max_files = 30
+max_results = 100
+max_investigation_rounds = 5
+allow_external_fetch = true
+
+[workflow]
+default = "adaptive"          # adaptive | feature | bug_fix | refactor | simple
+require_review = true
+require_verification = true
+require_spec_approval = "risk_based"
+require_plan_approval = "risk_based"
+verification_commands = ["cargo test --workspace"]
+
+[workflow.execution]
+strategy = "adaptive"
+max_parallel_coders = 3
+fresh_coder_per_task = true
+
+[skills]
+enabled = true
+lazy_loading = true
+project_skills_require_trust = true
+
+[budgets]
+task_cost_usd = 0.0
+task_wall_clock_secs = 0
 
 [permissions]
 default = "prompt"
@@ -167,6 +240,10 @@ kudelma --trust            # 仅本次运行信任
 
 | 行为 | 默认 |
 | --- | --- |
+| Agency 写文件、执行 Shell、派发 Coder、调用 MCP | 总是拒绝（`--yolo` 也不行） |
+| Agency / Lead 使用共享探索读取工作区外路径 | 询问 |
+| Coder 调用 `explore_codebase` | 总是拒绝 |
+| Coder 写 `allowed_paths` 之外或 `forbidden_paths` 内 | 总是拒绝 |
 | `read` / `glob` / `grep` / `ls` / `index`（工作区内） | 允许 |
 | `write` / `edit`（工作区内） | 允许 |
 | 工作区外读写 | 询问 |
@@ -201,7 +278,13 @@ TUI 权限弹窗：
 | `PageUp` / `PageDown` | 滚动 |
 | `Ctrl+C` | 退出 |
 
-内置命令：`/help`、`/new`、`/sessions`、`/resume`、`/model`、`/mode`、`/compact`、`/usage`、`/tasks`、`/rewind`、`/clear`、`/cd`、`/init`、`/quit`。
+内置命令：`/help`、`/new`、`/sessions`、`/resume`、`/model`、`/mode`、`/contract`、`/workflow`、`/skills`、`/verify`、`/compact`、`/usage`、`/tasks`、`/rewind`、`/clear`、`/cd`、`/init`、`/quit`。
+
+TUI 顶部状态栏显示：当前角色（`agency` / `lead`）、Lead 模式（`PLAN/BUILD/DEBUG/REVIEW`）、模型、工作流阶段与 Gate 进度、上下文占用和成本。发生迁移时显示原因，例如 `BUILD -> DEBUG: verification failed`。
+
+- `/mode` 无参数循环切换，`/mode debug` 直接切换。
+- `/contract` 查看当前契约，`/contract approve` 在 TUI 中批准高风险契约。
+- `/verify cargo test` 直接运行确定性验证并记录证据。
 
 ---
 
@@ -215,6 +298,9 @@ Commands:
   auth     管理凭据 (login/logout/status)
   models   列出模型、上下文与价格
   session  会话列表/删除/导出/导入
+  skill    技能列表/检视/启用/禁用
+  workflow 工作流预设、运行状态、恢复
+  task     Worker Task/Report、Exploration Report 历史
   index    Tree-sitter 符号骨架
   trust    管理受信任目录
   prompt   打印 System Prompt 或工具定义
@@ -224,7 +310,22 @@ Commands:
   doctor   环境与配置诊断
 ```
 
-常用参数：`-p`、`-m`、`-c`、`-r`、`--yolo`、`--trust`、`--plan`、`--output-format`、`--input-format`、`--max-turns`、`--system-prompt`、`--append-system-prompt`、`--allowed-tools`、`--disallowed-tools`、`--verbose`。
+常用参数：`-p`、`-m`、`-c`、`-r`、`--yolo`、`--trust`、`--plan`、`--mode plan|build|debug|review`、`--workflow adaptive|feature|bug_fix|refactor|simple`、`--direct-lead`、`--output-format`、`--input-format`、`--max-turns`、`--system-prompt`、`--append-system-prompt`、`--allowed-tools`、`--disallowed-tools`、`--verbose`。
+
+### Skills / Workflow / Task 检视
+
+```bash
+kudelma skill list --role lead --mode build
+kudelma skill inspect test-driven-development
+kudelma skill disable systematic-debugging
+
+kudelma workflow list
+kudelma workflow inspect <ID>
+kudelma workflow resume <ID>
+
+kudelma task history
+kudelma task inspect <TASK_OR_REPORT_ID>
+```
 
 ### 会话导出 / 导入
 
@@ -258,21 +359,31 @@ kudelma session import session.json
 kudelma (src/)
  ├── cli.rs / cmd.rs / headless.rs
  └── crates/
-     ├── kudelma-config      分层配置、权限规则、Provider/MCP/Hook 配置
-     ├── kudelma-storage     XDG 路径、原子写入、会话、凭据、信任、记忆
+     ├── kudelma-config      分层配置、角色/工作流/Skills、权限规则、MCP/Hook
+     ├── kudelma-storage     XDG 路径、原子写入、会话、契约/工作流/证据账本
      ├── kudelma-providers   Anthropic / OpenAI-compatible / Gemini 流式客户端
-     ├── kudelma-permissions 权限决策、Tree-sitter Bash 拆解、路径边界
+     ├── kudelma-permissions 角色能力矩阵、Coder 路径沙箱、Bash 拆解、路径边界
      ├── kudelma-tools       WorkspaceEnv + 内置工具（index/read/edit/bash/...）
-     ├── kudelma-core        Agent 循环、会话、压缩、子 Agent、MCP、Hooks
-     ├── kudelma-tui         ratatui TUI（Markdown、权限弹窗、选择器）
+     ├── kudelma-core
+     │    ├── agents/        Agency（Coder 复用 task worker）
+     │    ├── exploration/   共享只读确定性检索与证据报告（无模型、无会话）
+     │    ├── lead/          PLAN / BUILD / DEBUG / REVIEW 模式
+     │    ├── orchestration/ TaskContract / ContextPack / WorkerTask / Ledger
+     │    ├── skills/        SKILL.md 解析、注册、懒加载、信任隔离
+     │    ├── workflows/     工作流状态、阶段与 Gate
+     │    ├── verification/  Verifier、ExecutionEvidence、Gate 状态
+     │    └── runtime.rs     共享角色/模式/契约/工作流/账本状态
+     ├── kudelma-tui         ratatui TUI（角色/模式/Gate、契约、Skills、权限弹窗）
      └── kudelma-acp         Agent Client Protocol stdio 服务
 ```
 
 核心不变量：
 
+- **角色边界**：Agency 只澄清与通信；Lead 是唯一技术决策者；Exploration 是无模型的只读能力；Coder 受限；Verifier 非 LLM。
 - **Append-only**：对话只追加，不重写历史前缀，保护 Prompt Cache。
 - **环境隔离**：模型可见文件操作经 `WorkspaceEnv`，宿主状态只落 `StateDir`。
 - **Fail-closed**：拒绝优先；未信任目录只能收紧权限；带标签的权限响应防止迟到审批误用。
+- **证据优先**：代码变更会使旧的验证 Gate 失效；完成声明必须经过当前 diff 的 `ExecutionEvidence`。
 - **中断不浪费**：取消时保留已生成内容并闭合悬空工具调用。
 
 ---
@@ -293,7 +404,9 @@ cargo test --workspace
 
 - 目前 `WorkspaceEnv` 的实现是本地文件系统；接口已预留 SSH / 容器远端执行。
 - 图片输入在协议层已建模，CLI 尚未暴露附件参数。
-- MCP OAuth、Lua 插件热加载与 Web 搜索尚未内置；MCP stdio/HTTP 与 hooks 已可用。
+- Coder 调度当前按任务顺序执行；`max_parallel_coders` 已进入配置与 Ledger，但并行 worktree 编排仍在演进。
+- MCP OAuth、Lua 插件热加载与 Web 搜索尚未内置；MCP stdio/HTTP、Skills、Workflow、Hooks 与 ACP 已可用。
+- TDD Gate 已建模；当前基线通过 `verify` 的测试/构建证据完成验证，RED/GREEN 的细粒度自动判定可继续增强。
 - 模型价格与上下文窗口为内置目录数据，可通过 `[providers.*.models]` 覆盖。
 
 欢迎提交 Issue 与 PR。

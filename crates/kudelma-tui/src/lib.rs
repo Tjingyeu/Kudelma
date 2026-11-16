@@ -40,6 +40,9 @@ pub struct TuiParams {
     pub yolo: bool,
     pub trusted: bool,
     pub plan: bool,
+    pub mode: Option<String>,
+    pub workflow: Option<kudelma_config::WorkflowPreset>,
+    pub direct_lead: bool,
     pub max_turns: Option<u32>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -73,6 +76,10 @@ pub async fn run(params: TuiParams) -> Result<()> {
     if let Ok(history) = kudelma_storage::InputHistory::load() {
         app.history = history.lines().to_vec();
     }
+    app.role = session.role.clone();
+    app.contract = session.contract.clone();
+    app.workflow = Some(session.workflow.clone());
+    app.skills = Some(session.skills.clone());
     app.set_mode_name(session.meta.mode.clone());
 
     let (_guard, mut terminal) = TerminalGuard::init(params.config.ui.mouse)?;
@@ -170,17 +177,28 @@ async fn process_effects(
                 control.set_model(spec);
             }
             Effect::Rewind(index) => control.rewind(index),
-            Effect::ToggleMode => {
-                let next = if app.mode_name == "plan" {
-                    AgentMode::Build
+            Effect::SetMode(name) => {
+                let path = plans_dir()
+                    .unwrap_or_else(|_| state_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .join(format!("{}.md", session.id));
+                if let Some(mode) = AgentMode::from_name(&name, path) {
+                    app.set_mode_name(mode.name());
+                    control.set_mode(mode);
                 } else {
-                    let path = plans_dir()
-                        .unwrap_or_else(|_| state_dir().unwrap_or_else(|_| PathBuf::from(".")))
-                        .join(format!("{}.md", session.id));
-                    AgentMode::Plan(path)
-                };
-                app.set_mode_name(next.name());
-                control.set_mode(next);
+                    app.push_error(format!("unknown mode `{name}`"));
+                }
+            }
+            Effect::ApproveContract(contract_id) => {
+                control.approve_contract(contract_id);
+                app.push_info("Contract approval sent to Lead.");
+            }
+            Effect::Verify(command) => {
+                app.push_info(format!("Running verification: {command}"));
+                control.verify(command);
+            }
+            Effect::SwitchToAgency => {
+                control.switch_to_agency();
+                app.role = "agency".into();
             }
             Effect::Shell(command) => match run_shell(app.cwd(), &command).await {
                 Ok(output) => app.push_info(output.trim_end().to_string()),
@@ -224,6 +242,10 @@ async fn process_effects(
                         app.reset(session.meta.clone(), session.timeline.clone(), models);
                         app.files = files.clone();
                         app.set_cwd(target_cwd);
+                        app.role = session.role.clone();
+                        app.contract = session.contract.clone();
+                        app.workflow = Some(session.workflow.clone());
+                        app.skills = Some(session.skills.clone());
                         app.set_mode_name(session.meta.mode.clone());
                     }
                     Err(error) => {
@@ -255,6 +277,10 @@ fn build_params(
         resume,
         session_id: None,
         plan,
+        mode: params.mode.clone(),
+        workflow: params.workflow,
+        direct_lead: params.direct_lead,
+        auto_approve_contracts: false,
         max_turns: params.max_turns,
         system_prompt: params.system_prompt.clone(),
         append_system_prompt: params.append_system_prompt.clone(),

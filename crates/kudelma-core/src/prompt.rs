@@ -5,15 +5,80 @@ use std::path::{Path, PathBuf};
 use kudelma_config::{Config, INSTRUCTION_FILES};
 use kudelma_storage::{MemoryStore, canonicalize_lenient};
 
-use crate::agent::AgentMode;
+use crate::lead::LeadMode;
+use crate::orchestration::TaskContract;
+use crate::skills::SkillRegistry;
+use crate::workflows::WorkflowState;
 
 const MAX_INSTRUCTION_BYTES: usize = 32 * 1024;
 const MAX_INSTRUCTION_LEVELS: usize = 4;
 
-pub fn build_system_prompt(
+pub fn build_agency_prompt(
     config: &Config,
     cwd: &Path,
-    mode: &AgentMode,
+    skills: &SkillRegistry,
+    contract: Option<&TaskContract>,
+    workflow: Option<&WorkflowState>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are Agency, the developer-facing intent agent for Kudelma.\n\
+         You clarify what the developer wants. You do not implement code, run commands, or make final technical decisions.\n\
+         Exploration is a shared read-only capability, not another agent or model: `explore_codebase` performs deterministic retrieval and returns file:symbol:line evidence that you interpret yourself.\n\n",
+    );
+    prompt.push_str(&format!(
+        "Working directory: {}\nPlatform: {}\nDate: {}\n\n",
+        cwd.display(),
+        std::env::consts::OS,
+        chrono::Utc::now().format("%Y-%m-%d")
+    ));
+    prompt.push_str(
+        "Routing rules:\n\
+         - General question: answer directly and concisely.\n\
+         - Codebase or architecture question: call `explore_codebase` for deterministic read-only evidence, then answer with file:symbol:line citations. Do not activate Lead.\n\
+         - Feature, bug, change, or planning request: ask only questions that materially change scope or acceptance; then call `submit_contract`.\n\
+         - Status question: explain the current contract/workflow state if available, without starting work.\n\
+         - Never edit files, never run shell commands, never dispatch coder, never call MCP.\n\
+         - Ask at most one focused clarification question per turn; record safe assumptions instead of blocking.\n\
+         - If important ambiguity remains, put it in unresolved_questions and keep the contract in needs_clarification.\n\
+         - Do not mark work approved yourself. Developer approval is a separate step.\n\n",
+    );
+    if let Some(contract) = contract {
+        prompt.push_str("## Current Task Contract\n");
+        prompt.push_str(&contract.render());
+        prompt.push_str(
+            "\nUse submit_contract to revise it when the developer changes the request.\n\n",
+        );
+    }
+    if let Some(workflow) = workflow {
+        prompt.push_str("## Current Workflow\n");
+        prompt.push_str(&workflow.render());
+        prompt.push('\n');
+    }
+    let skills = skills.prompt_section("agency", "build");
+    if !skills.is_empty() {
+        prompt.push_str("## Skills\n");
+        prompt.push_str(&skills);
+        prompt.push('\n');
+    }
+    let memory = memory_context(cwd);
+    if !memory.is_empty() {
+        prompt.push_str("## Memories\n");
+        prompt.push_str(&memory);
+        prompt.push('\n');
+    }
+    if let Some(extra) = config.system_prompt_extra() {
+        prompt.push_str(&extra);
+    }
+    prompt
+}
+
+pub fn build_lead_prompt(
+    config: &Config,
+    cwd: &Path,
+    mode: &LeadMode,
+    skills: &SkillRegistry,
+    contract: Option<&TaskContract>,
     custom: Option<&str>,
     append: Option<&str>,
 ) -> String {
@@ -27,50 +92,65 @@ pub fn build_system_prompt(
     }
     let mut prompt = String::new();
     prompt.push_str(
-        "You are Kudelma, an AI coding agent running in the user's terminal.\n\
-         Work directly in the repository, keep changes focused, and verify your work.\n\n",
+        "You are Lead, the single technical decision-maker and orchestrator for Kudelma.\n\
+         You own PLAN, BUILD, DEBUG and REVIEW as modes of this same session. You may implement inline or delegate bounded implementation to Coder. Use `explore_codebase` for shared deterministic read-only evidence; it does not start another model.\n\n",
     );
     prompt.push_str(&format!(
-        "Working directory: {}\nPlatform: {}\nDate: {}\n\n",
+        "Working directory: {}\nPlatform: {}\nDate: {}\nCurrent mode: {}\n\n",
         cwd.display(),
         std::env::consts::OS,
-        chrono::Utc::now().format("%Y-%m-%d")
+        chrono::Utc::now().format("%Y-%m-%d"),
+        mode.name()
     ));
-    prompt.push_str(
-        "Tool guidelines:\n\
-         - Use `index` to locate symbols before reading a large file; then `read` only the lines you need.\n\
-         - Read a file before editing it. Use `edit` for targeted changes and `write` only for new files or full rewrites.\n\
-         - Use `glob` and `grep` instead of shell `find`/`grep`; they respect .gitignore and return less noise.\n\
-         - Use `todo_write` for multi-step work so progress is visible.\n\
-         - Use `bash` for builds, tests and git. Long output keeps its beginning and end; full logs are saved for `read`.\n\
-         - Prefer `task` with `explore` for broad code searches and with `plan` for architecture work; only the summary returns here.\n\
-         - Never invent file contents. If a tool fails, read the error and try a different approach.\n\
-         - Be concise. Explain what you changed and why, not a play-by-play.\n\n",
-    );
-    if let AgentMode::Plan(path) = mode {
-        prompt.push_str(&format!(
-            "# Plan mode\n\
-             You are planning, not implementing. Explore the code and write a concrete plan to {}.\n\
-             Do not modify other files and do not run mutating shell commands; ask before running anything.\n\n",
-            path.display()
-        ));
+    if let Some(contract) = contract {
+        prompt.push_str("## Approved Task Contract\n");
+        prompt.push_str(&contract.render());
+        prompt.push('\n');
     }
-
+    prompt.push_str(match mode {
+        LeadMode::Plan(_) => {
+            "PLAN posture: read-only. Gather evidence, explore alternatives, write a small ordered plan with tests and risks. Use `lead_mode` to move to build when the plan is actionable.\n"
+        }
+        LeadMode::Build => {
+            "BUILD posture: implement the approved plan or task. Keep changes focused. Use TDD when behavior changes. Use `verify` for commands that must become evidence. Use `lead_mode` to move to review.\n"
+        }
+        LeadMode::Debug => {
+            "DEBUG posture: reproduce, collect evidence, test hypotheses, identify the root cause, then fix the smallest cause. Do not stack speculative edits. Use `verify` for regression checks.\n"
+        }
+        LeadMode::Review => {
+            "REVIEW posture: compare the actual diff and evidence with every acceptance criterion, then check quality, error handling, security and compatibility. Do not edit code in review. A final answer in this mode records review completion.\n"
+        }
+    });
+    prompt.push_str(
+        "\nTool rules:\n\
+         - Use `index` before reading large files; read before editing.\n\
+         - Use `grep`/`glob` for narrow searches and `explore_codebase` for task-scoped evidence; deterministic exploration has no model of its own.\n\
+         - Use `task` only to delegate bounded implementation to a Coder.\n\
+         - Do not claim a test/build passed without evidence from `verify`.\n\
+         - Only switch modes with the `lead_mode` tool and state a reason.\n\
+         - Ask the developer only through Agency; if blocked, report the blocker instead of inventing requirements.\n\
+         - Be concise; explain changes and evidence, not a play-by-play.\n\n",
+    );
+    let skill_section = skills.prompt_section("lead", mode.name());
+    if !skill_section.is_empty() {
+        prompt.push_str("## Skills\n");
+        prompt.push_str(&skill_section);
+        prompt.push('\n');
+    }
     let memory = memory_context(cwd);
     if !memory.is_empty() {
-        prompt.push_str("# Memories\n");
+        prompt.push_str("## Memories\n");
         prompt.push_str(&memory);
-        prompt.push_str("\n\n");
+        prompt.push('\n');
     }
     let instructions = instruction_context(cwd);
     if !instructions.is_empty() {
-        prompt.push_str("# Project instructions\n");
+        prompt.push_str("## Project instructions\n");
         prompt.push_str(&instructions);
-        prompt.push_str("\n\n");
+        prompt.push('\n');
     }
     if let Some(extra) = config.system_prompt_extra() {
         prompt.push_str(&extra);
-        prompt.push('\n');
     }
     if let Some(append) = append {
         prompt.push_str(append);
@@ -79,25 +159,30 @@ pub fn build_system_prompt(
     prompt
 }
 
-pub fn build_subagent_prompt(cwd: &Path, kind: &str) -> String {
-    let role = match kind {
-        "explore" => {
-            "You are an exploration subagent. Search the repository and report concrete findings. \
-             Use read, glob, grep and index. Never edit files. Answer with file paths and line numbers."
-        }
-        "plan" => {
-            "You are a planning subagent. Inspect the code and produce an ordered implementation plan \
-             with risks and verification steps. Never edit files."
-        }
-        _ => {
-            "You are an implementation subagent. Make the requested focused change, run the relevant \
-             checks, and report exactly what changed. Do not expand the scope."
-        }
-    };
+pub fn build_system_prompt(
+    config: &Config,
+    cwd: &Path,
+    mode: &LeadMode,
+    custom: Option<&str>,
+    append: Option<&str>,
+) -> String {
+    build_lead_prompt(
+        config,
+        cwd,
+        mode,
+        &SkillRegistry::empty(),
+        None,
+        custom,
+        append,
+    )
+}
+
+pub fn build_subagent_prompt(cwd: &Path) -> String {
     format!(
-        "{role}\n\nWorking directory: {}\nPlatform: {}\n\
-         Keep the final report short: what you found or changed, file:line references, and any \
-         command whose output matters.\n",
+        "You are a Coder, a scoped implementation worker. Make the requested focused change, \
+         run authorized checks, and report exactly what changed. Do not expand the scope or dispatch agents.\n\n\
+         Working directory: {}\nPlatform: {}\n\
+         Keep the final report short: what you changed, file:line references, and any command whose output matters.\n",
         cwd.display(),
         std::env::consts::OS
     )
@@ -192,10 +277,10 @@ mod tests {
         let prompt = build_system_prompt(
             &config,
             dir.path(),
-            &AgentMode::Plan(dir.path().join("plan.md")),
+            &LeadMode::Plan(dir.path().join("plan.md")),
             None,
             None,
         );
-        assert!(prompt.contains("Plan mode"));
+        assert!(prompt.contains("PLAN posture"));
     }
 }

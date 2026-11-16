@@ -9,6 +9,7 @@ use crate::id::{new_id, now_rfc3339};
 use crate::{StorageError, atomic_write, paths::sessions_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionMeta {
     pub id: String,
     pub title: String,
@@ -20,6 +21,31 @@ pub struct SessionMeta {
     pub output_tokens: u64,
     pub cost_usd: f64,
     pub mode: String,
+    pub active_role: String,
+    pub lead_mode: String,
+    pub contract_id: Option<String>,
+    pub workflow_id: Option<String>,
+}
+
+impl Default for SessionMeta {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: "New session".into(),
+            model: String::new(),
+            cwd: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            mode: "build".into(),
+            active_role: "agency".into(),
+            lead_mode: "build".into(),
+            contract_id: None,
+            workflow_id: None,
+        }
+    }
 }
 
 impl SessionMeta {
@@ -36,6 +62,10 @@ impl SessionMeta {
             output_tokens: 0,
             cost_usd: 0.0,
             mode: "build".into(),
+            active_role: "agency".into(),
+            lead_mode: "build".into(),
+            contract_id: None,
+            workflow_id: None,
         }
     }
 }
@@ -46,6 +76,8 @@ pub struct StoredSession {
     #[serde(default)]
     pub messages: Vec<Value>,
     #[serde(default)]
+    pub agency_messages: Vec<Value>,
+    #[serde(default)]
     pub plan_path: Option<String>,
 }
 
@@ -54,6 +86,7 @@ impl StoredSession {
         Self {
             meta,
             messages: Vec::new(),
+            agency_messages: Vec::new(),
             plan_path: None,
         }
     }

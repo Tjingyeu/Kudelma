@@ -49,25 +49,19 @@ impl Tool for IndexTool {
                 ToolError::Io(format!("cannot read {}: {error}", path.display()))
             })?;
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let language = language_for(&path).ok_or_else(|| {
-            ToolError::InvalidArgs(format!(
+        if !supports_source(&path) {
+            return Err(ToolError::InvalidArgs(format!(
                 "index does not support {}; supported: {}. Use read instead.",
                 path.extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("this file"),
                 "rs, ts, tsx, js, jsx, py, go, c, h, cc, cpp, hpp"
-            ))
-        })?;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&language)
-            .map_err(|error| ToolError::Other(format!("cannot load parser: {error}")))?;
-        let tree = parser
-            .parse(&text, None)
+            )));
+        }
+        let outline = outline_source(&path, &text)
             .ok_or_else(|| ToolError::Other("failed to parse source".into()))?;
-        let has_errors = tree.root_node().has_error();
-        let mut symbols = Vec::new();
-        collect(tree.root_node(), text.as_bytes(), 0, &mut symbols);
+        let has_errors = outline.has_errors;
+        let symbols = outline.symbols;
         let total_lines = text.lines().count();
         let mut output = format!(
             "{} — {total_lines} lines, {} symbol{}{}\n",
@@ -101,7 +95,7 @@ impl Tool for IndexTool {
     }
 }
 
-struct Symbol {
+struct SymbolInternal {
     kind: &'static str,
     name: String,
     start: usize,
@@ -109,12 +103,56 @@ struct Symbol {
     depth: usize,
 }
 
-fn collect(node: Node<'_>, source: &[u8], depth: usize, out: &mut Vec<Symbol>) {
+/// Deterministic Tree-sitter symbol outline shared with the exploration
+/// capability. Unsupported languages return `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolOutline {
+    pub kind: &'static str,
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceOutline {
+    pub symbols: Vec<SymbolOutline>,
+    pub has_errors: bool,
+}
+
+pub fn outline_source(path: &Path, text: &str) -> Option<SourceOutline> {
+    let language = language_for(path)?;
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(text, None)?;
+    let has_errors = tree.root_node().has_error();
+    let mut symbols = Vec::new();
+    collect(tree.root_node(), text.as_bytes(), 0, &mut symbols);
+    Some(SourceOutline {
+        symbols: symbols
+            .into_iter()
+            .map(|symbol| SymbolOutline {
+                kind: symbol.kind,
+                name: symbol.name,
+                start: symbol.start,
+                end: symbol.end,
+                depth: symbol.depth,
+            })
+            .collect(),
+        has_errors,
+    })
+}
+
+pub fn supports_source(path: &Path) -> bool {
+    language_for(path).is_some()
+}
+
+fn collect(node: Node<'_>, source: &[u8], depth: usize, out: &mut Vec<SymbolInternal>) {
     let mut child_depth = depth;
     if let Some(kind) = symbol_kind(node.kind()) {
         if !inside_function(node) {
             let name = symbol_name(node, source).unwrap_or_else(|| "<anonymous>".into());
-            out.push(Symbol {
+            out.push(SymbolInternal {
                 kind,
                 name,
                 start: node.start_position().row + 1,

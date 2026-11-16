@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+ignore.workspace = true
 kudelma-config.workspace = true
 kudelma-permissions.workspace = true
 kudelma-providers.workspace = true

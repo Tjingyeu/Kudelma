@@ -7,6 +7,7 @@ pub mod lock;
 pub mod memory;
 pub mod paths;
 pub mod sessions;
+pub mod store;
 pub mod trust;
 
 pub use auth::AuthStore;
@@ -15,10 +16,12 @@ pub use id::{KudelmaId, new_id, now_rfc3339};
 pub use lock::{ClaimError, SessionClaim};
 pub use memory::{MemoryEntry, MemoryStore};
 pub use paths::{
-    canonicalize_lenient, clean_path, config_dir, incremental_canonicalize, is_within, plans_dir,
-    sessions_dir, state_dir,
+    canonicalize_lenient, clean_path, config_dir, contracts_dir, evidence_dir, exploration_dir,
+    incremental_canonicalize, is_within, plans_dir, sessions_dir, state_dir, tasks_dir,
+    user_skills_dir, workflows_dir,
 };
 pub use sessions::{SessionError, SessionMeta, SessionStore, StoredSession};
+pub use store::ArtifactStore;
 pub use trust::TrustStore;
 
 use std::fs;

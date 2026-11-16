@@ -40,6 +40,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mode_color = if app.mode_name == "plan" {
+        app.theme.warning
+    } else if app.mode_name == "review" {
+        app.theme.accent
+    } else if app.mode_name == "debug" {
+        app.theme.error
+    } else {
+        app.theme.success
+    };
     let mut spans = vec![
         Span::styled(
             "Kudelma",
@@ -48,17 +57,32 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
-        Span::styled(&app.model_spec, Style::default().fg(app.theme.assistant)),
-        Span::styled("  ", Style::default()),
+        Span::styled(format!("{}:", app.role), Style::default().fg(app.theme.dim)),
         Span::styled(
             app.mode_name.to_uppercase(),
-            Style::default().fg(if app.mode_name == "plan" {
-                app.theme.warning
-            } else {
-                app.theme.success
-            }),
+            Style::default().fg(mode_color),
+        ),
+        Span::styled(
+            format!("  {}", clip(&app.model_spec, 32)),
+            Style::default().fg(app.theme.dim),
         ),
     ];
+    if let Some(workflow) = &app.workflow {
+        let gates = workflow
+            .gates
+            .values()
+            .filter(|gate| !matches!(gate.status.label(), "pending" | "failed"))
+            .count();
+        spans.push(Span::styled(
+            format!(
+                "  {} · {}/{} gates",
+                workflow.stage.name(),
+                gates,
+                workflow.gates.len()
+            ),
+            Style::default().fg(app.theme.dim),
+        ));
+    }
     if app.context_window > 0 {
         let percent = (app.context_tokens * 100 / u64::from(app.context_window)).min(100);
         spans.push(Span::styled(
