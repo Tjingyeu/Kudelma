@@ -10,7 +10,9 @@ use crate::exploration::{self, Caller, ExplorationLimits, InvestigationMode};
 use crate::lead::LeadMode;
 use crate::orchestration::{Complexity, ContractStatus, IntentKind, TaskContract};
 use crate::runtime::RuntimeState;
-use crate::verification::EvidenceKind;
+use crate::verification::{
+    CriterionResult, CriterionStatus, EvidenceKind, ReviewFinding, ReviewReport, ReviewStatus,
+};
 use crate::workflows::WorkflowKind;
 use kudelma_tools::{
     Tool, ToolContext, ToolError, ToolOutput, ToolPermission, object_schema, required_str,
@@ -103,6 +105,10 @@ impl Tool for LeadModeTool {
         ToolKey::native("lead_mode")
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn permission(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolPermission, ToolError> {
         Ok(ToolPermission::new(vec![Scope::exact(format!(
             "mode:{}",
@@ -119,12 +125,12 @@ impl Tool for LeadModeTool {
         let mode = LeadMode::from_name(&mode_name, plan_path)
             .ok_or_else(|| ToolError::InvalidArgs(format!("unknown mode `{mode_name}`")))?;
         let previous = self.runtime.mode_name();
-        if self.runtime.set_mode(mode, &reason) {
-            Ok(ToolOutput::success(format!(
+        match self.runtime.set_mode(mode, &reason) {
+            Ok(true) => Ok(ToolOutput::success(format!(
                 "Lead mode: {previous} -> {mode_name} ({reason})"
-            )))
-        } else {
-            Ok(ToolOutput::success(format!("Already in {mode_name} mode.")))
+            ))),
+            Ok(false) => Ok(ToolOutput::success(format!("Already in {mode_name} mode."))),
+            Err(error) => Err(ToolError::Other(error)),
         }
     }
 }
@@ -155,12 +161,14 @@ impl Tool for VerifyTool {
     }
 
     fn key(&self) -> ToolKey {
-        // Verification commands execute through the same shell boundary and
-        // must obey bash deny rules, not a weaker private tool key.
-        ToolKey::native("bash")
+        ToolKey::native("verify")
     }
 
-    fn permission(&self, args: &Value, _ctx: &ToolContext) -> Result<ToolPermission, ToolError> {
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    fn permission(&self, args: &Value, ctx: &ToolContext) -> Result<ToolPermission, ToolError> {
         if args.get("skip_reason").and_then(Value::as_str).is_some() {
             return Ok(ToolPermission::new(vec![Scope::exact(format!(
                 "skip:{}",
@@ -173,6 +181,7 @@ impl Tool for VerifyTool {
             scopes: analysis.scopes,
             force_prompt: analysis.force_prompt,
             reason: Some("verification commands are subject to permission policy".into()),
+            cwd: Some(ctx.cwd().to_path_buf()),
         })
     }
 
@@ -200,7 +209,13 @@ impl Tool for VerifyTool {
         let evidence = self
             .runtime
             .verifier
-            .run(&command, ctx.cwd(), kind, &ctx.cancel)
+            .run(
+                &command,
+                ctx.cwd(),
+                kind,
+                self.runtime.mutation_generation(),
+                &ctx.cancel,
+            )
             .await
             .map_err(ToolError::Other)?;
         self.runtime.record_verification(&evidence);
@@ -352,6 +367,147 @@ impl Tool for ExploreCodebaseTool {
     }
 }
 
+pub struct ReviewTool {
+    pub runtime: Arc<RuntimeState>,
+}
+
+#[async_trait]
+impl Tool for ReviewTool {
+    fn name(&self) -> &'static str {
+        "submit_review"
+    }
+
+    fn description(&self) -> &'static str {
+        "Submit the structured REVIEW result for the current contract and workspace revision. Only available to Lead in review mode. Approved reports must cite verification evidence and mark every acceptance criterion as met."
+    }
+
+    fn schema(&self) -> Value {
+        object_schema(
+            json!({
+                "status": { "type": "string", "enum": ["approved", "changes_requested", "blocked"] },
+                "criteria": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "criterion": { "type": "string" },
+                            "status": { "type": "string", "enum": ["met", "partial", "unmet"] },
+                            "evidence_ids": { "type": "array", "items": { "type": "string" } },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["criterion", "status"]
+                    }
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": { "type": "string" },
+                            "message": { "type": "string" },
+                            "file": { "type": "string" }
+                        },
+                        "required": ["severity", "message"]
+                    }
+                },
+                "evidence_ids": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["status", "criteria"],
+        )
+    }
+
+    fn key(&self) -> ToolKey {
+        ToolKey::native("submit_review")
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    fn permission(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolPermission, ToolError> {
+        Ok(ToolPermission::new(vec![Scope::exact("review")]))
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        if self.runtime.mode_name() != "review" {
+            return Err(ToolError::Other(
+                "submit_review is only available in Lead review mode".into(),
+            ));
+        }
+        let contract = self
+            .runtime
+            .contract()
+            .ok_or_else(|| ToolError::Other("a review requires a task contract".into()))?;
+        let status = match required_str(&args, "status")?.as_str() {
+            "approved" => ReviewStatus::Approved,
+            "changes_requested" => ReviewStatus::ChangesRequested,
+            "blocked" => ReviewStatus::Blocked,
+            other => {
+                return Err(ToolError::InvalidArgs(format!(
+                    "unknown review status `{other}`"
+                )));
+            }
+        };
+        let criteria = args
+            .get("criteria")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| CriterionResult {
+                        criterion: item["criterion"].as_str().unwrap_or_default().into(),
+                        status: match item["status"].as_str() {
+                            Some("met") => Some(CriterionStatus::Met),
+                            Some("partial") => Some(CriterionStatus::Partial),
+                            Some("unmet") => Some(CriterionStatus::Unmet),
+                            _ => None,
+                        },
+                        evidence_ids: string_list(item, "evidence_ids"),
+                        note: item["note"].as_str().map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let findings = args
+            .get("findings")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| ReviewFinding {
+                        severity: item["severity"].as_str().unwrap_or("info").into(),
+                        message: item["message"].as_str().unwrap_or_default().into(),
+                        file: item["file"].as_str().map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let revision = self.runtime.current_revision().await;
+        let report = ReviewReport {
+            report_version: 1,
+            review_id: kudelma_storage::new_id(),
+            session_id: self.runtime.session_id.clone(),
+            contract_id: contract.contract_id.clone(),
+            contract_version: contract.contract_version,
+            revision,
+            criteria,
+            findings,
+            evidence_ids: string_list(&args, "evidence_ids"),
+            status,
+            created_at: kudelma_storage::now_rfc3339(),
+        };
+        let report = self
+            .runtime
+            .submit_review(report)
+            .await
+            .map_err(ToolError::Other)?;
+        Ok(ToolOutput::success(report.render()).with_metadata(json!({
+            "review_id": report.review_id,
+            "status": report.status.name(),
+        })))
+    }
+}
+
 pub struct SubmitContractTool {
     pub runtime: Arc<RuntimeState>,
 }
@@ -431,7 +587,7 @@ impl Tool for SubmitContractTool {
                 kudelma_config::ApprovalPolicy::Always => false,
             };
             if auto_approve {
-                contract.approve();
+                contract.approve().map_err(ToolError::Other)?;
             } else {
                 contract.status = ContractStatus::ReadyForLead;
             }
@@ -507,8 +663,11 @@ pub fn register_lead_tools(
             runtime: runtime.clone(),
         }));
     }
-    if matches!(role, AgentRole::Lead | AgentRole::Coder) {
+    if role == AgentRole::Lead {
         registry.register(Arc::new(VerifyTool {
+            runtime: runtime.clone(),
+        }));
+        registry.register(Arc::new(ReviewTool {
             runtime: runtime.clone(),
         }));
     }

@@ -9,6 +9,7 @@ pub struct PermissionAsk {
     pub tool: String,
     pub scopes: Vec<String>,
     pub reason: Option<String>,
+    pub requires_exact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,7 @@ pub enum AgentEvent {
     ContractUpdated(TaskContract),
     WorkflowUpdated(WorkflowState),
     Verification(ExecutionEvidence),
+    ReviewUpdated(crate::verification::ReviewReport),
     TimelineReset(Vec<crate::session::SessionTimeline>),
     TurnDone {
         reason: TurnEndReason,

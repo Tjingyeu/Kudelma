@@ -170,6 +170,50 @@ pub fn builtin_providers() -> Vec<ProviderPreset> {
             ],
         },
         ProviderPreset {
+            name: "opencode-go",
+            kind: ProviderKind::Openai,
+            base_url: "https://opencode.ai/inference/go/openai/v1",
+            api_key_env: "OPENCODE_API_KEY",
+            models: vec![
+                model(
+                    "kimi-k2.7-code",
+                    256_000,
+                    32_768,
+                    0.95,
+                    4.0,
+                    ConfigTier::Strong,
+                    true,
+                ),
+                model(
+                    "glm-5.3-flash",
+                    128_000,
+                    16_384,
+                    0.15,
+                    0.50,
+                    ConfigTier::Medium,
+                    true,
+                ),
+                model(
+                    "gpt-6-luna",
+                    272_000,
+                    32_768,
+                    0.10,
+                    0.50,
+                    ConfigTier::Strong,
+                    true,
+                ),
+                model(
+                    "claude-haiku-5-5",
+                    100_000,
+                    16_384,
+                    0.10,
+                    0.50,
+                    ConfigTier::Medium,
+                    true,
+                ),
+            ],
+        },
+        ProviderPreset {
             name: "moonshot",
             kind: ProviderKind::Openai,
             base_url: "https://api.moonshot.ai/v1",
@@ -595,5 +639,48 @@ mod tests {
         let model = resolve_model(&config, None, "ollama/qwen2.5-coder:32b").unwrap();
         assert_eq!(model.require_key().unwrap(), "");
         assert!(model.is_local());
+    }
+
+    #[test]
+    fn includes_the_opencode_go_catalog() {
+        let preset = builtin_providers()
+            .into_iter()
+            .find(|preset| preset.name == "opencode-go")
+            .expect("opencode-go preset");
+        assert_eq!(
+            preset.base_url,
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(preset.api_key_env, "OPENCODE_API_KEY");
+        assert_eq!(preset.kind, ProviderKind::Openai);
+        assert!(
+            preset
+                .models
+                .iter()
+                .any(|model| model.id == "kimi-k2.7-code")
+        );
+        assert!(
+            preset
+                .models
+                .iter()
+                .any(|model| model.id == "glm-5.3-flash")
+        );
+    }
+
+    #[test]
+    fn resolves_opencode_go_models_through_the_shared_catalog() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "opencode-go".into(),
+            ProviderConfig {
+                api_key: Some("test-key".into()),
+                ..ProviderConfig::default()
+            },
+        );
+        let model = resolve_model(&config, None, "opencode-go/kimi-k2.7-code").unwrap();
+        assert_eq!(model.provider, "opencode-go");
+        assert_eq!(model.base_url, "https://opencode.ai/inference/go/openai/v1");
+        assert_eq!(model.api_key.as_deref(), Some("test-key"));
+        assert_eq!(model.kind, ProviderKind::Openai);
     }
 }

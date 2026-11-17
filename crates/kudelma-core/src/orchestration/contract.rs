@@ -121,11 +121,7 @@ impl TaskContract {
         Self {
             contract_version: 1,
             contract_id: kudelma_storage::new_id(),
-            status: if complexity.requires_approval() {
-                ContractStatus::ReadyForLead
-            } else {
-                ContractStatus::Approved
-            },
+            status: ContractStatus::ReadyForLead,
             source_session_id: session_id.into(),
             intent_kind,
             complexity,
@@ -159,11 +155,22 @@ impl TaskContract {
         Ok(())
     }
 
-    pub fn approve(&mut self) {
+    pub fn approve(&mut self) -> Result<(), String> {
+        if self.status != ContractStatus::ReadyForLead {
+            return Err(format!(
+                "contract {} is {}; only ready_for_lead contracts can be approved",
+                self.contract_id,
+                self.status.name()
+            ));
+        }
+        if !self.unresolved_questions.is_empty() {
+            return Err("contract still has unresolved questions".into());
+        }
         self.status = ContractStatus::Approved;
         self.approval.developer_confirmed = true;
         self.approval.approved_at = Some(now_rfc3339());
         self.updated_at = now_rfc3339();
+        self.validate()
     }
 
     pub fn needs_approval(&self) -> bool {
@@ -246,14 +253,14 @@ impl ContractStore {
         let mut next = contract;
         next.contract_version += 1;
         next.updated_at = now_rfc3339();
-        next.status = if next.unresolved_questions.is_empty() && next.complexity.requires_approval()
-        {
+        next.approval = ContractApproval::default();
+        next.status = if next.unresolved_questions.is_empty() {
             ContractStatus::ReadyForLead
-        } else if next.unresolved_questions.is_empty() {
-            ContractStatus::Approved
         } else {
             ContractStatus::NeedsClarification
         };
+        next.validate()
+            .map_err(|error| StorageError::Io(std::io::Error::other(error)))?;
         self.save(&next)?;
         Ok(next)
     }
@@ -270,10 +277,11 @@ impl ContractStore {
         Ok(contracts)
     }
 
-    pub fn approve(&self, id: &str) -> Result<TaskContract, StorageError> {
-        let mut contract = self.load(id)?;
-        contract.approve();
-        self.save(&contract)?;
+    pub fn approve(&self, id: &str) -> Result<TaskContract, String> {
+        let mut contract = self.load(id).map_err(|error| error.to_string())?;
+        contract.approve()?;
+        self.save(&contract).map_err(|error| error.to_string())?;
+        contract.validate()?;
         Ok(contract)
     }
 }
@@ -294,10 +302,24 @@ mod tests {
     }
 
     #[test]
+    fn only_ready_contracts_can_be_approved() {
+        let mut contract = TaskContract::new("s", IntentKind::FeatureRequest, Complexity::L2, "x");
+        contract.status = ContractStatus::NeedsClarification;
+        assert!(contract.approve().is_err());
+        contract.status = ContractStatus::ReadyForLead;
+        contract.unresolved_questions.push("choose storage".into());
+        assert!(contract.approve().is_err());
+        contract.unresolved_questions.clear();
+        contract.approve().unwrap();
+        assert_eq!(contract.status, ContractStatus::Approved);
+        assert!(contract.approval.developer_confirmed);
+    }
+
+    #[test]
     fn approval_records_timestamp_and_confirmation() {
         let mut contract = TaskContract::new("s", IntentKind::BugReport, Complexity::Bug, "fix");
         assert_eq!(contract.status, ContractStatus::ReadyForLead);
-        contract.approve();
+        contract.approve().unwrap();
         assert_eq!(contract.status, ContractStatus::Approved);
         assert!(contract.approval.developer_confirmed);
         assert!(contract.approval.approved_at.is_some());
@@ -315,5 +337,28 @@ mod tests {
         assert!(text.contains("observed evidence"));
         assert!(text.contains("assumption"));
         assert!(text.contains("unknown"));
+    }
+
+    #[test]
+    fn store_rejects_contracts_that_are_not_ready_for_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ContractStore::from_store(ArtifactStore::new(dir.path().to_path_buf()));
+        let mut contract = TaskContract::new("s", IntentKind::FeatureRequest, Complexity::L2, "x");
+        contract.status = ContractStatus::NeedsClarification;
+        store.save(&contract).unwrap();
+        assert!(store.approve(&contract.contract_id).is_err());
+    }
+
+    #[test]
+    fn contract_revision_clears_the_previous_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ContractStore::from_store(ArtifactStore::new(dir.path().to_path_buf()));
+        let mut contract = TaskContract::new("s", IntentKind::FeatureRequest, Complexity::L2, "x");
+        contract.approve().unwrap();
+        store.save(&contract).unwrap();
+        let next = store.update(contract).unwrap();
+        assert_eq!(next.status, ContractStatus::ReadyForLead);
+        assert!(!next.approval.developer_confirmed);
+        assert!(next.approval.approved_at.is_none());
     }
 }

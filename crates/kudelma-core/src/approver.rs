@@ -20,7 +20,10 @@ pub struct AutoApprover {
 
 #[async_trait]
 impl Approver for AutoApprover {
-    async fn ask(&self, _ask: PermissionAsk) -> PermissionAnswer {
+    async fn ask(&self, ask: PermissionAsk) -> PermissionAnswer {
+        if ask.requires_exact {
+            return PermissionAnswer::Deny;
+        }
         if self.allow {
             PermissionAnswer::AllowOnce
         } else {
@@ -84,5 +87,27 @@ impl Approver for ChannelApprover {
                 PermissionAnswer::Deny
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(requires_exact: bool) -> PermissionAsk {
+        PermissionAsk {
+            request_id: "test".into(),
+            tool: "bash".into(),
+            scopes: vec!["echo hi > /tmp/x".into()],
+            reason: None,
+            requires_exact,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_approver_never_auto_approves_exact_requests() {
+        let approver = AutoApprover { allow: true };
+        assert_eq!(approver.ask(ask(true)).await, PermissionAnswer::Deny);
+        assert_eq!(approver.ask(ask(false)).await, PermissionAnswer::AllowOnce);
     }
 }

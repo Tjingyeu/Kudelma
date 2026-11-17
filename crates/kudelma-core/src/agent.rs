@@ -72,6 +72,7 @@ pub struct Agent {
     active_role: String,
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
+    dynamic_context_hash: Option<u64>,
     allowed_tools: Option<HashSet<String>>,
     disallowed_tools: HashSet<String>,
     max_turns: u32,
@@ -80,6 +81,7 @@ pub struct Agent {
     context_tokens: u64,
     auth: Option<AuthStore>,
     _mcp: McpManager,
+    background_running: u32,
 }
 
 impl Agent {
@@ -115,7 +117,7 @@ impl Agent {
             state_dir: init.state_dir.clone(),
             session_id: init.meta.id.clone(),
             model: RwLock::new(init.model.clone()),
-            auth: init.auth.clone(),
+            auth: RwLock::new(init.auth.clone()),
             permissions: init.permissions.clone(),
             approver: init.approver.clone(),
             events: init.events.clone(),
@@ -134,6 +136,10 @@ impl Agent {
             init.runtime.clone(),
             kudelma_permissions::AgentRole::Lead,
         );
+        tools.set_policy(kudelma_tools::ToolPolicy::new(
+            init.allowed_tools.clone().map(|set| set.into_iter()),
+            init.disallowed_tools.iter().cloned(),
+        ));
         if let Some(plan) = init.runtime.mode().plan_path() {
             init.permissions.set_plan_path(Some(plan.to_path_buf()));
         }
@@ -159,6 +165,7 @@ impl Agent {
             active_role,
             system_prompt: init.system_prompt,
             append_system_prompt: init.append_system_prompt,
+            dynamic_context_hash: None,
             allowed_tools: init.allowed_tools,
             disallowed_tools: init.disallowed_tools,
             max_turns: init.max_turns,
@@ -171,6 +178,7 @@ impl Agent {
             context_tokens: 0,
             auth: init.auth,
             _mcp: init.mcp,
+            background_running: 0,
         }
     }
 
@@ -184,6 +192,7 @@ impl Agent {
     }
 
     pub async fn handle_background(&mut self, notice: BackgroundNotice) {
+        self.background_running = self.background_running.saturating_sub(1);
         self.push_background_notice(notice);
         let reason = self.run_loop().await;
         self.finish_turn(reason).await;
@@ -219,6 +228,7 @@ impl Agent {
             &self.model,
             &self.history,
             instructions.as_deref(),
+            &self.meta.id,
             &self.cancel,
         )
         .await
@@ -251,46 +261,35 @@ impl Agent {
         self.save();
     }
 
-    pub fn set_mode(&mut self, mode: AgentMode) {
-        self.set_mode_reason(mode, "requested by the developer");
+    pub fn set_mode(&mut self, mode: AgentMode) -> Result<(), String> {
+        self.set_mode_reason(mode, "requested by the developer")
     }
 
-    pub fn set_mode_reason(&mut self, mode: AgentMode, reason: &str) {
+    pub fn set_mode_reason(&mut self, mode: AgentMode, reason: &str) -> Result<(), String> {
         if self.runtime.mode() == mode {
-            return;
+            return Ok(());
         }
-        self.runtime.set_mode(mode.clone(), reason);
+        self.runtime.set_mode(mode.clone(), reason)?;
         self.permissions
             .set_plan_path(mode.plan_path().map(Path::to_path_buf));
+        self.permissions.set_mode(mode.permission_mode());
         self.meta.mode = mode.name().into();
         self.meta.lead_mode = mode.name().into();
         if let AgentMode::Plan(path) = &mode {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            self.history.push(Message::user(format!(
-                "[context update] PLAN mode ({reason}). Explore read-only, then write the plan to {}.",
-                path.display()
-            )));
-        } else {
-            self.history.push(Message::user(format!(
-                "[context update] {} mode ({reason}).",
-                mode.name().to_uppercase()
-            )));
         }
         self.save();
+        Ok(())
     }
 
     fn sync_mode(&mut self) {
         let mode = self.runtime.mode();
         let name = mode.name().to_string();
-        if self.meta.lead_mode != name {
-            self.history.push(Message::user(format!(
-                "[context update] Lead mode is now {name}."
-            )));
-        }
         self.permissions
             .set_plan_path(mode.plan_path().map(Path::to_path_buf));
+        self.permissions.set_mode(mode.permission_mode());
         self.meta.lead_mode = name.clone();
         self.meta.mode = name;
     }
@@ -306,6 +305,7 @@ impl Agent {
             .map_err(|error| error.to_string())?;
         self.model = model.clone();
         self.meta.model = model.spec();
+        self.meta.lead_model = model.spec();
         *self
             .task_state
             .model
@@ -317,6 +317,39 @@ impl Agent {
             .send(AgentEvent::Info(format!("Model: {}", self.meta.model)));
         self.save();
         Ok(())
+    }
+
+    pub fn set_agency_model(&mut self, spec: &str) {
+        self.meta.agency_model = spec.to_string();
+        if self.active_role == "agency" {
+            self.meta.model = spec.to_string();
+        }
+        self.save_as_role("agency");
+    }
+
+    pub fn refresh_model(&mut self) -> Result<(), String> {
+        let spec = self.model.spec();
+        let model =
+            resolve_model(&self.config, self.auth.as_ref(), &spec).map_err(|e| e.to_string())?;
+        self.model = model.clone();
+        *self
+            .task_state
+            .model
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = model;
+        let role = self.active_role.clone();
+        self.save_as_role(&role);
+        Ok(())
+    }
+
+    pub fn update_auth(&mut self, auth: AuthStore) {
+        self.auth = Some(auth.clone());
+        self.runtime.update_auth(auth.clone());
+        *self
+            .task_state
+            .auth
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(auth);
     }
 
     pub fn rewind(&mut self, user_index: usize) -> bool {
@@ -373,7 +406,12 @@ impl Agent {
         meta.active_role = role.into();
         meta.contract_id = self.runtime.contract().map(|contract| contract.contract_id);
         meta.workflow_id = Some(self.runtime.workflow().id);
-        meta.model = self.model.spec();
+        meta.lead_model = self.model.spec();
+        meta.model = if role == "agency" && !meta.agency_model.is_empty() {
+            meta.agency_model.clone()
+        } else {
+            meta.lead_model.clone()
+        };
         self.meta = meta.clone();
         let messages = self
             .history
@@ -410,7 +448,11 @@ impl Agent {
     pub async fn shutdown(&mut self) {
         let role = self.active_role.clone();
         self.save_as_role(&role);
-        crate::hooks::run_session_end(&self.config.hooks, Path::new(&self.meta.cwd)).await;
+        if let Some(message) =
+            crate::hooks::run_session_end(&self.config.hooks, Path::new(&self.meta.cwd)).await
+        {
+            let _ = self.events.send(AgentEvent::Info(message));
+        }
     }
 
     pub fn push_notice(&mut self, text: impl Into<String>) {
@@ -457,6 +499,7 @@ impl Agent {
         let mut auto_verified = false;
         loop {
             self.sync_mode();
+            self.sync_dynamic_context();
             if let Some(budget) = self.runtime.budget_blocker() {
                 let _ = self.events.send(AgentEvent::Error(budget));
                 return TurnEndReason::Blocked;
@@ -482,6 +525,7 @@ impl Agent {
                 max_tokens: self.model.max_output_tokens.clamp(1024, 16_384),
                 temperature: None,
                 thinking: None,
+                session_id: Some(self.meta.id.clone()),
             };
             let provider = provider_for(&self.model);
             let (tx, mut rx) = unbounded_channel();
@@ -575,6 +619,11 @@ impl Agent {
                 usage.output_tokens = text.chars().count() as u64 / 4 + 1;
             }
             self.add_usage(usage);
+            if let Some(budget) = self.runtime.budget_blocker() {
+                let _ = self.events.send(AgentEvent::Error(budget));
+                self.save();
+                return TurnEndReason::Blocked;
+            }
             self.context_tokens =
                 estimate_request_tokens(Some(&system), &self.history, &definitions);
             self.emit_usage();
@@ -600,7 +649,12 @@ impl Agent {
                 content: blocks,
             });
             if calls.is_empty() {
-                if let Some(blocker) = self.runtime.completion_blocker() {
+                if let Some(background) = self.background_blocker("") {
+                    let _ = self.events.send(AgentEvent::Info(background));
+                    self.save();
+                    return TurnEndReason::Blocked;
+                }
+                if let Some(blocker) = self.runtime.completion_blocker().await {
                     let attempts = self
                         .runtime
                         .blocked_attempts
@@ -624,6 +678,7 @@ impl Agent {
                                     &command,
                                     Path::new(&self.meta.cwd),
                                     crate::verification::EvidenceKind::Custom,
+                                    self.runtime.mutation_generation(),
                                     &self.cancel,
                                 )
                                 .await
@@ -671,6 +726,7 @@ impl Agent {
                         ),
                         is_error: true,
                         name: Some(call.name.clone()),
+                        metadata: None,
                     });
                     continue;
                 }
@@ -688,8 +744,23 @@ impl Agent {
                     &call,
                 )
                 .await;
-                if !result.is_error && matches!(call.name.as_str(), "write" | "edit" | "bash") {
-                    self.runtime.invalidate_verification();
+                if !result.is_error {
+                    let read_only = self
+                        .tools
+                        .get(&call.name)
+                        .map(|tool| tool.read_only())
+                        .unwrap_or(false);
+                    if !read_only {
+                        self.runtime.invalidate_verification();
+                    }
+                    if result
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata["background"].as_bool())
+                        == Some(true)
+                    {
+                        self.background_running += 1;
+                    }
                 }
                 results.push(result);
             }
@@ -780,15 +851,38 @@ impl Agent {
     }
 
     fn system_prompt_text(&self) -> String {
-        crate::prompt::build_lead_prompt(
+        crate::prompt::build_lead_stable_prompt(
+            &self.config,
+            Path::new(&self.meta.cwd),
+            self.system_prompt.as_deref(),
+            self.append_system_prompt.as_deref(),
+        )
+    }
+
+    fn background_blocker(&self, blocker: &str) -> Option<String> {
+        (self.background_running > 0).then(|| {
+            format!(
+                "background write task still running ({} active); wait for its completion notice before finishing. {blocker}",
+                self.background_running
+            )
+        })
+    }
+
+    fn sync_dynamic_context(&mut self) {
+        let context = crate::prompt::build_lead_context(
             &self.config,
             Path::new(&self.meta.cwd),
             &self.runtime.mode(),
             &self.runtime.skills,
             self.runtime.contract().as_ref(),
-            self.system_prompt.as_deref(),
-            self.append_system_prompt.as_deref(),
-        )
+            Some(&self.runtime.workflow()),
+        );
+        let hash = text_hash(&context);
+        if self.dynamic_context_hash != Some(hash) {
+            self.dynamic_context_hash = Some(hash);
+            self.history
+                .push(Message::user(format!("[context update]\n{context}")));
+        }
     }
 
     fn set_title(&mut self, text: &str) {
@@ -806,4 +900,13 @@ impl Agent {
                 .send(AgentEvent::Info(format!("Session: {}", self.meta.title)));
         }
     }
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::revision::WorkspaceRevision;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
@@ -50,6 +52,10 @@ pub struct ExecutionEvidence {
     pub log_path: Option<String>,
     pub git_head: Option<String>,
     pub git_diff_hash: Option<String>,
+    #[serde(default)]
+    pub revision_before: Option<WorkspaceRevision>,
+    #[serde(default)]
+    pub revision_after: Option<WorkspaceRevision>,
     pub changed_files: Vec<String>,
     pub result: EvidenceResult,
     pub skip_reason: Option<String>,

@@ -463,6 +463,10 @@ fn forward_event(
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": format!("\n[verify {}] {}\n", evidence.result.name(), evidence.command) }
         })),
+        AgentEvent::ReviewUpdated(report) => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("\n[review {}] {}\n", report.status.name(), report.render()) }
+        })),
         AgentEvent::TurnDone { reason, .. } => {
             let sender = completions
                 .lock()

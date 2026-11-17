@@ -108,6 +108,18 @@ pub struct WorkflowState {
     pub contract_id: Option<String>,
     #[serde(default)]
     pub contract_version: u32,
+    #[serde(default)]
+    pub plan_path: Option<String>,
+    #[serde(default)]
+    pub plan_hash: Option<String>,
+    #[serde(default)]
+    pub design_hash: Option<String>,
+    #[serde(default)]
+    pub review_report_id: Option<String>,
+    #[serde(default)]
+    pub review_fingerprint: Option<String>,
+    #[serde(default)]
+    pub review_contract_version: Option<u32>,
     pub gates: BTreeMap<String, GateView>,
     pub transitions: Vec<ModeTransition>,
     pub skills_loaded: Vec<String>,
@@ -148,6 +160,12 @@ impl WorkflowState {
             complexity,
             contract_id: None,
             contract_version: 0,
+            plan_path: None,
+            plan_hash: None,
+            design_hash: None,
+            review_report_id: None,
+            review_fingerprint: None,
+            review_contract_version: None,
             gates,
             transitions: Vec::new(),
             skills_loaded: Vec::new(),
@@ -192,6 +210,12 @@ impl WorkflowState {
             self.accepted = false;
             self.evidence_ids.clear();
             self.review_completed = false;
+            self.plan_path = None;
+            self.plan_hash = None;
+            self.design_hash = None;
+            self.review_report_id = None;
+            self.review_fingerprint = None;
+            self.review_contract_version = None;
             self.stage = match WorkflowKind::from_contract(contract) {
                 WorkflowKind::Feature | WorkflowKind::Refactor => WorkflowStage::Plan,
                 WorkflowKind::BugFix => WorkflowStage::Debug,
@@ -262,12 +286,6 @@ impl WorkflowState {
 
     pub fn record_mode(&mut self, from: &str, to: &str, reason: &str) {
         self.mode = to.into();
-        if from == "plan" && to != "plan" {
-            self.set_gate(GateKind::Plan, GateStatus::Passed, None, None);
-            if self.complexity == Complexity::L3 {
-                self.set_gate(GateKind::Design, GateStatus::Passed, None, None);
-            }
-        }
         self.stage = match to {
             "plan" => WorkflowStage::Plan,
             "debug" => WorkflowStage::Debug,
@@ -325,6 +343,33 @@ impl WorkflowState {
     pub fn mark_review_complete(&mut self) {
         self.review_completed = true;
         self.set_gate(GateKind::Review, GateStatus::Passed, None, None);
+    }
+
+    pub fn record_review(
+        &mut self,
+        report_id: &str,
+        fingerprint: &str,
+        contract_version: u32,
+        approved: bool,
+        reason: Option<String>,
+    ) {
+        self.review_report_id = Some(report_id.into());
+        self.review_fingerprint = Some(fingerprint.into());
+        self.review_contract_version = Some(contract_version);
+        self.review_completed = approved;
+        self.set_gate(
+            GateKind::Review,
+            if approved {
+                GateStatus::Passed
+            } else {
+                GateStatus::Failed
+            },
+            reason,
+            Some(report_id.into()),
+        );
+        if !approved {
+            self.stage = WorkflowStage::Build;
+        }
     }
 
     pub fn render(&self) -> String {
@@ -409,10 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_completed_by_leaving_plan_mode() {
+    fn plan_is_not_completed_by_leaving_plan_mode() {
         let mut state = WorkflowState::new("s", WorkflowKind::Feature, Complexity::L2);
         state.record_mode("plan", "build", "plan approved");
-        assert_eq!(state.gate(GateKind::Plan), GateStatus::Passed);
+        assert_eq!(state.gate(GateKind::Plan), GateStatus::Pending);
     }
 
     #[test]

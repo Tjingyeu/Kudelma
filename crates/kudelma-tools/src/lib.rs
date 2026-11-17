@@ -82,6 +82,34 @@ pub struct ToolPermission {
     pub scopes: Vec<Scope>,
     pub force_prompt: bool,
     pub reason: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolPolicy {
+    allowed: Option<HashSet<String>>,
+    disallowed: HashSet<String>,
+}
+
+impl ToolPolicy {
+    pub fn new(
+        allowed: Option<impl IntoIterator<Item = String>>,
+        disallowed: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            allowed: allowed.map(|items| items.into_iter().collect()),
+            disallowed: disallowed.into_iter().collect(),
+        }
+    }
+
+    pub fn permits(&self, name: &str) -> bool {
+        if self.disallowed.contains(name) {
+            return false;
+        }
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(name))
+    }
 }
 
 impl ToolPermission {
@@ -90,6 +118,7 @@ impl ToolPermission {
             scopes,
             force_prompt: false,
             reason: None,
+            cwd: None,
         }
     }
 
@@ -98,6 +127,7 @@ impl ToolPermission {
             scopes,
             force_prompt: true,
             reason: Some(reason.into()),
+            cwd: None,
         }
     }
 }
@@ -209,6 +239,7 @@ pub struct ToolRegistry(Arc<RegistryInner>);
 struct RegistryInner {
     tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
     hidden: RwLock<HashSet<String>>,
+    policy: RwLock<ToolPolicy>,
 }
 
 impl ToolRegistry {
@@ -231,6 +262,15 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if !self
+            .0
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .permits(name)
+        {
+            return None;
+        }
         self.0
             .tools
             .read()
@@ -239,24 +279,40 @@ impl ToolRegistry {
             .cloned()
     }
 
+    pub fn set_policy(&self, policy: ToolPolicy) {
+        *self.0.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    pub fn policy(&self) -> ToolPolicy {
+        self.0
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn names(&self) -> Vec<String> {
+        let policy = self.0.policy.read().unwrap_or_else(|e| e.into_inner());
         self.0
             .tools
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
+            .filter(|name| policy.permits(name))
             .cloned()
             .collect()
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let hidden = self.0.hidden.read().unwrap_or_else(|e| e.into_inner());
+        let policy = self.0.policy.read().unwrap_or_else(|e| e.into_inner());
         self.0
             .tools
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|tool| !hidden.contains(tool.name()))
+            .filter(|tool| policy.permits(tool.name()))
             .map(|tool| tool.definition())
             .collect()
     }
@@ -286,10 +342,12 @@ impl ToolRegistry {
     pub fn search(&self, query: &str) -> Vec<Arc<dyn Tool>> {
         let query = query.to_ascii_lowercase();
         let hidden = self.0.hidden.read().unwrap_or_else(|e| e.into_inner());
+        let policy = self.0.policy.read().unwrap_or_else(|e| e.into_inner());
         let tools = self.0.tools.read().unwrap_or_else(|e| e.into_inner());
         tools
             .values()
             .filter(|tool| hidden.contains(tool.name()))
+            .filter(|tool| policy.permits(tool.name()))
             .filter(|tool| {
                 tool.name().to_ascii_lowercase().contains(&query)
                     || tool.description().to_ascii_lowercase().contains(&query)
@@ -456,5 +514,49 @@ mod tests {
     fn object_schema_marks_required_fields() {
         let schema = object_schema(json!({ "path": { "type": "string" } }), &["path"]);
         assert_eq!(schema["required"][0], "path");
+    }
+
+    #[test]
+    fn tool_policy_filters_schema_and_execution() {
+        let registry = ToolRegistry::new();
+        registry.register_all(builtin_tools());
+        registry.set_policy(ToolPolicy::new(
+            Some(vec!["read".to_string()]),
+            Vec::<String>::new(),
+        ));
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("bash").is_none());
+        assert!(
+            registry
+                .definitions()
+                .iter()
+                .all(|tool| tool.name == "read")
+        );
+        assert!(matches!(
+            registry.permission(
+                "bash",
+                &json!({ "command": "true" }),
+                &ToolContext::new(
+                    Arc::new(LocalEnv::new(std::path::PathBuf::from("."))),
+                    std::path::PathBuf::from("."),
+                    "test",
+                    kudelma_providers::CancelToken::new(),
+                    Arc::new(Config::default()),
+                )
+            ),
+            Err(ToolError::InvalidArgs(_))
+        ));
+    }
+
+    #[test]
+    fn tool_policy_blocks_deferred_search() {
+        let registry = ToolRegistry::new();
+        registry.register_all(builtin_tools());
+        registry.hide(&["bash".to_string()]);
+        registry.set_policy(ToolPolicy::new(
+            None::<Vec<String>>,
+            vec!["bash".to_string()],
+        ));
+        assert!(registry.search("bash").is_empty());
     }
 }

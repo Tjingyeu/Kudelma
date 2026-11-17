@@ -33,6 +33,15 @@ cargo build --release
 - Exploration is a shared read-only capability (`crates/kudelma-core/src/exploration/`), not
   an agent and never a model call. Agency and Lead interpret its evidence with their own model.
 - PLAN/BUILD/DEBUG/REVIEW are modes of one Lead session, never separate agents.
+- PLAN and REVIEW are enforced in `kudelma-permissions` before `--yolo`. PLAN requires a real
+  plan artifact before leaving; REVIEW requires a structured `ReviewReport` bound to the current
+  workspace revision.
+- Coder has no Bash/Verify by default. Enabling `agents.coder.allow_shell` removes the file-write
+  isolation guarantee and must not be described as a hard sandbox.
+- Verification evidence is bound to `WorkspaceRevision`; code or workspace changes invalidate it.
+- Complex shell, redirection and outside-workspace cwd require exact approval; `--yolo` and
+  `--allowed-tools bash` do not bypass exact approval.
+- Pre-tool hooks are fail-closed: only exit code 0 allows the tool.
 - Agency and Lead histories are separate; lead receives a Context Pack, not the Agency transcript.
 - Only Lead may dispatch Coder. Agency may invoke shared deterministic exploration read-only.
 - Skills and Workflows never grant permissions; `kudelma-permissions` remains the final authority.

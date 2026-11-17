@@ -14,6 +14,10 @@ pub struct SessionMeta {
     pub id: String,
     pub title: String,
     pub model: String,
+    #[serde(default)]
+    pub agency_model: String,
+    #[serde(default)]
+    pub lead_model: String,
     pub cwd: String,
     pub created_at: String,
     pub updated_at: String,
@@ -33,6 +37,8 @@ impl Default for SessionMeta {
             id: String::new(),
             title: "New session".into(),
             model: String::new(),
+            agency_model: String::new(),
+            lead_model: String::new(),
             cwd: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -55,6 +61,8 @@ impl SessionMeta {
             id: new_id(),
             title: "New session".into(),
             model: model.into(),
+            agency_model: model.into(),
+            lead_model: model.into(),
             cwd: cwd.display().to_string(),
             created_at: now.clone(),
             updated_at: now,
@@ -215,5 +223,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::with_dir(dir.path().to_path_buf());
         assert!(store.load("../escape").is_err());
+    }
+
+    #[test]
+    fn new_sessions_track_role_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = SessionMeta::new("opencode-go/kimi-k2.7-code", dir.path());
+        assert_eq!(meta.model, "opencode-go/kimi-k2.7-code");
+        assert_eq!(meta.agency_model, meta.model);
+        assert_eq!(meta.lead_model, meta.model);
+    }
+
+    #[test]
+    fn legacy_session_metadata_loads_without_role_models() {
+        let meta: SessionMeta =
+            serde_json::from_str(r#"{"id":"legacy","model":"anthropic/claude-sonnet-4-5"}"#)
+                .unwrap();
+        assert_eq!(meta.model, "anthropic/claude-sonnet-4-5");
+        assert!(meta.agency_model.is_empty());
+        assert!(meta.lead_model.is_empty());
     }
 }

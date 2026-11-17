@@ -43,6 +43,15 @@ impl LeadMode {
     pub fn plan(path: PathBuf) -> Self {
         Self::Plan(path)
     }
+
+    pub fn permission_mode(&self) -> kudelma_permissions::PermissionMode {
+        match self {
+            Self::Plan(_) => kudelma_permissions::PermissionMode::Plan,
+            Self::Build => kudelma_permissions::PermissionMode::Build,
+            Self::Debug => kudelma_permissions::PermissionMode::Debug,
+            Self::Review => kudelma_permissions::PermissionMode::Review,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

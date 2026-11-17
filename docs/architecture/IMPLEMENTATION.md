@@ -34,7 +34,21 @@ Agency and Lead histories are separate inside one session record (`StoredSession
 
 `lead/mod.rs` defines `LeadMode::{Plan, Build, Debug, Review}`. `runtime.rs` owns the current
 mode and records every transition with a reason into `WorkflowState`. Switching mode never
-creates a new Lead session.
+creates a new Lead session. `kudelma-permissions::PermissionMode` mirrors these phases:
+PLAN and REVIEW are enforced before YOLO; REVIEW is read-only except for controlled verification
+and `submit_review`. Leaving PLAN requires a non-empty plan artifact with verification steps;
+L3 additionally requires `## Design` and `## Risks` sections.
+
+## Verification and review
+
+`verification/runner.rs` records command, cwd, timestamps, exit code, Git HEAD, diff hash and
+output. Every evidence record stores `WorkspaceRevision` before and after execution. Completion
+recomputes the revision and rejects passed evidence from another cwd or revision. Any successful
+non-read-only tool bumps the mutation generation and invalidates verification/review gates.
+
+`verification/review.rs` defines the structured `ReviewReport`. REVIEW only passes when a report
+matches the current contract version and workspace revision, cites verification evidence, and
+marks every acceptance criterion as met. `changes_requested` or `blocked` keeps Finish blocked.
 
 ## Skills
 
@@ -53,16 +67,31 @@ changed files and output. Code edits invalidate a previously passed verification
 
 ## Permissions
 
-`kudelma-permissions` has three roles: `AgentRole::{Agency, Lead, Coder}` plus `CoderScope`.
-Role restrictions are evaluated before `--yolo`; Coder writes are checked against
-`allowed_paths` and `forbidden_paths`; deny rules remain highest priority. Agency is read-only.
-Agency and Lead may call `explore_codebase`; Coder cannot dispatch it. Untrusted projects still
+`kudelma-permissions` has three roles: `AgentRole::{Agency, Lead, Coder}` plus `CoderScope` and
+`PermissionMode`. Role and mode restrictions are evaluated before `--yolo`; Coder writes are
+checked against `allowed_paths` and `forbidden_paths`; deny rules remain highest priority. Agency
+is read-only. Agency and Lead may call `explore_codebase`; Coder cannot dispatch it. Coder has no
+Bash or Verify by default; `allow_shell` is an explicit opt-out from file-write isolation.
+Complex shell and outside-workspace Bash cwd require exact approval (`requires_exact`) and are
+denied by the headless AutoApprover. Pre-tool hooks are fail-closed. Untrusted projects still
 contribute deny rules but cannot change providers, hooks, MCP servers or skills.
+
+## Provider connections
+
+`kudelma-providers` ships built-in presets plus user-defined OpenAI-compatible providers.
+`AuthStore` holds API keys in the private state file; `/connect` and `kudelma models --connect`
+write there. `opencode-go` is a built-in preset for the OpenCode Go subscription:
+OpenAI-compatible Chat Completions at
+`https://opencode.ai/inference/go/openai/v1`, credential `OPENCODE_API_KEY`, and the documented
+Go model catalog. Go requests attach `kudelma/<version>` as the User-Agent and a stable
+`x-opencode-session` derived from the session/role. OpenCode Go does not use a separate
+transport in this baseline.
 
 ## Interfaces
 
-- CLI: `kudelma skill|workflow|task`, `--mode`, `--workflow`, `--direct-lead`.
-- TUI: role/mode/workflow/gate status bar, `/mode`, `/contract approve`, `/workflow`,
-  `/skills`, `/verify`, `/agency`.
+- CLI: `kudelma skill|workflow|task`, `kudelma auth login <provider>`,
+  `kudelma models`, `kudelma models --connect`, `--mode`, `--workflow`, `--direct-lead`.
+- TUI: role/mode/workflow/gate status bar, `/connect`, `/models`, `/mode`,
+  `/contract approve`, `/workflow`, `/skills`, `/verify`, `/agency`.
 - Headless: same orchestration; contracts are auto-approved for unattended runs.
 - ACP: `session/new`, `session/prompt`, `session/update`, `session/cancel`, mode/model updates.

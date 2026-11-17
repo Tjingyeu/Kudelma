@@ -52,7 +52,7 @@ pub struct TuiParams {
     pub initial_prompt: Option<String>,
 }
 
-pub async fn run(params: TuiParams) -> Result<()> {
+pub async fn run(mut params: TuiParams) -> Result<()> {
     let cwd = canonicalize_lenient(&params.cwd);
     let mut session = spawn_session(build_params(
         &params,
@@ -91,7 +91,7 @@ pub async fn run(params: TuiParams) -> Result<()> {
             &mut app,
             &mut session,
             &mut control,
-            &params,
+            &mut params,
             &mut files,
         )
         .await;
@@ -141,7 +141,7 @@ pub async fn run(params: TuiParams) -> Result<()> {
             &mut app,
             &mut session,
             &mut control,
-            &params,
+            &mut params,
             &mut files,
         )
         .await;
@@ -157,7 +157,7 @@ async fn process_effects(
     app: &mut App,
     session: &mut SessionHandle,
     control: &mut kudelma_core::session::SessionControl,
-    params: &TuiParams,
+    params: &mut TuiParams,
     files: &mut Vec<String>,
 ) {
     for effect in effects {
@@ -175,6 +175,32 @@ async fn process_effects(
             Effect::SetModel(spec) => {
                 app.model_spec = spec.clone();
                 control.set_model(spec);
+            }
+            Effect::ConnectProvider { provider, mut key } => {
+                let trimmed = key.trim().to_string();
+                key.clear();
+                if trimmed.is_empty() {
+                    app.push_error("API key cannot be empty.");
+                    continue;
+                }
+                match AuthStore::load().and_then(|mut auth| {
+                    auth.set(&provider, &trimmed)?;
+                    Ok(auth)
+                }) {
+                    Ok(auth) => {
+                        params.auth = Some(auth.clone());
+                        control.update_auth(auth.clone());
+                        app.refresh_models(all_models(&params.config, Some(&auth)));
+                        app.push_info(format!(
+                            "Connected {}. Open /models to choose a model.",
+                            provider
+                        ));
+                        app.open_model_picker();
+                    }
+                    Err(error) => {
+                        app.push_error(format!("cannot save credentials for {provider}: {error}"))
+                    }
+                }
             }
             Effect::Rewind(index) => control.rewind(index),
             Effect::SetMode(name) => {
@@ -263,10 +289,7 @@ fn build_params(
     resume: Option<StoredSession>,
     plan: bool,
 ) -> SessionParams {
-    let model = params
-        .model
-        .clone()
-        .or_else(|| resume.as_ref().map(|session| session.meta.model.clone()));
+    let model = params.model.clone();
     SessionParams {
         cwd,
         config: params.config.clone(),

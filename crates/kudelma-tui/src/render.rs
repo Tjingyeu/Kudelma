@@ -283,7 +283,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect)
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let lines: Vec<Line<'static>> = match overlay {
+    let mut lines: Vec<Line<'static>> = match overlay {
         Overlay::Help => help_lines(app),
         Overlay::Sessions { items, selected } => items
             .iter()
@@ -332,14 +332,70 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect)
                     Span::styled(model.spec(), style),
                     Span::styled(
                         format!(
-                            "  {:>7} ctx  ${:.2}/${:.2}",
-                            model.context_window, model.input_cost, model.output_cost
+                            "  {:>7} ctx  ${:.2}/${:.2}  {}",
+                            model.context_window,
+                            model.input_cost,
+                            model.output_cost,
+                            if model.api_key.is_some() || model.is_local() {
+                                "connected"
+                            } else {
+                                "connect key"
+                            }
                         ),
                         Style::default().fg(app.theme.dim),
                     ),
                 ])
             })
             .collect(),
+        Overlay::Providers { items, selected } => items
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                let selected = index == *selected;
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(app.theme.assistant)
+                };
+                Line::from(vec![
+                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(provider.name.clone(), style),
+                    Span::styled(
+                        format!(
+                            "  ({})  {}",
+                            provider.id,
+                            if provider.connected {
+                                "connected · press Enter to replace key"
+                            } else {
+                                "not connected · press Enter to add key"
+                            }
+                        ),
+                        Style::default().fg(app.theme.dim),
+                    ),
+                ])
+            })
+            .collect(),
+        Overlay::ConnectKey { provider, .. } => vec![
+            Line::from(Span::styled(
+                format!("Connect {} ({})", provider.name, provider.id),
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from("Paste or type the provider API key. Input is hidden."),
+            if provider.id == "opencode-go" {
+                Line::from("Get the key from https://opencode.ai/console (Go subscription).")
+            } else {
+                Line::default()
+            },
+            Line::default(),
+            Line::from("Key: •••••••• (hidden)"),
+            Line::default(),
+            Line::from("Enter connect · Esc cancel"),
+        ],
         Overlay::Tasks { selected } => {
             if app.tasks.is_empty() {
                 vec![Line::from(Span::styled(
@@ -398,6 +454,17 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, area: Rect)
             })
             .collect(),
     };
+    match overlay {
+        Overlay::Models { .. } => lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Enter switch · c connect provider · Esc close",
+            Style::default().fg(app.theme.dim),
+        ))),
+        Overlay::Providers { .. } => lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Enter connect or replace key · Esc close",
+            Style::default().fg(app.theme.dim),
+        ))),
+        _ => {}
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -466,6 +533,12 @@ fn draw_permission(
         lines.push(Line::from(Span::styled(
             reason.clone(),
             Style::default().fg(app.theme.dim),
+        )));
+    }
+    if ask.requires_exact {
+        lines.push(Line::from(Span::styled(
+            "Exact approval required for this command.",
+            Style::default().fg(app.theme.warning),
         )));
     }
     lines.push(Line::default());

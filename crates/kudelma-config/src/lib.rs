@@ -449,6 +449,42 @@ mod tests {
     }
 
     #[test]
+    fn role_model_specs_cover_the_three_model_architecture() {
+        let mut config = Config::default();
+        config.agency.provider = Some("opencode-go".into());
+        config.agency.model = Some("glm-5.3-flash".into());
+        config.agents.coder.provider = Some("openai".into());
+        config.agents.coder.model = Some("gpt-4.1".into());
+        assert_eq!(
+            config.role_model_spec("agency").as_deref(),
+            Some("opencode-go/glm-5.3-flash")
+        );
+        assert_eq!(
+            config.role_model_spec("coder").as_deref(),
+            Some("openai/gpt-4.1")
+        );
+        assert!(config.role_model_spec("explorer").is_none());
+    }
+
+    #[test]
+    fn parses_exploration_bounds() {
+        let config: Config = toml::from_str(
+            r#"
+[exploration]
+enabled = false
+max_files = 7
+max_results = 11
+allow_external_fetch = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.exploration.enabled);
+        assert_eq!(config.exploration.file_limit(), 7);
+        assert_eq!(config.exploration.result_limit(), 11);
+        assert!(!config.exploration.allow_external_fetch);
+    }
+
+    #[test]
     fn untrusted_projects_cannot_change_providers_or_hooks() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(PROJECT_DIR)).unwrap();

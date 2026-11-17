@@ -50,14 +50,33 @@ struct TurnResult {
 }
 
 pub async fn run(options: HeadlessOptions) -> Result<()> {
+    let initial_lead = options.direct_lead
+        || options
+            .resume
+            .as_ref()
+            .is_some_and(|session| session.meta.active_role == "lead");
     let model_spec = options
         .model
         .clone()
         .or_else(|| {
+            options.resume.as_ref().map(|session| {
+                if initial_lead {
+                    if session.meta.lead_model.is_empty() {
+                        session.meta.model.clone()
+                    } else {
+                        session.meta.lead_model.clone()
+                    }
+                } else if session.meta.agency_model.is_empty() {
+                    session.meta.model.clone()
+                } else {
+                    session.meta.agency_model.clone()
+                }
+            })
+        })
+        .or_else(|| {
             options
-                .resume
-                .as_ref()
-                .map(|session| session.meta.model.clone())
+                .config
+                .role_model_spec(if initial_lead { "lead" } else { "agency" })
         })
         .unwrap_or_else(|| options.config.default_model.clone());
     let model = resolve_model(&options.config, options.auth.as_ref(), &model_spec)?;
@@ -72,7 +91,7 @@ pub async fn run(options: HeadlessOptions) -> Result<()> {
     let mut handle = spawn_session(SessionParams {
         cwd: options.cwd.clone(),
         config: options.config.clone(),
-        model: Some(model_spec.clone()),
+        model: options.model.clone(),
         auth: options.auth.clone(),
         yolo: options.yolo,
         trusted: options.trusted,
@@ -101,7 +120,7 @@ pub async fn run(options: HeadlessOptions) -> Result<()> {
                 "type": "system",
                 "subtype": "init",
                 "session_id": handle.id,
-                "model": model_spec,
+                "model": handle.meta.model.clone(),
                 "cwd": options.cwd,
             })
         );
@@ -367,6 +386,21 @@ async fn run_turn(
                     );
                 } else if options.verbose {
                     eprintln!("[verify {}] {}", evidence.result.name(), evidence.command);
+                }
+            }
+            AgentEvent::ReviewUpdated(report) => {
+                if options.output == OutputFormat::StreamJson {
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "review",
+                            "id": report.review_id,
+                            "status": report.status.name(),
+                            "contract_id": report.contract_id,
+                        })
+                    );
+                } else if options.verbose {
+                    eprintln!("[review {}] {}", report.status.name(), report.review_id);
                 }
             }
             AgentEvent::TimelineReset(_) => {}

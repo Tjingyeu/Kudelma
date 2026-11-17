@@ -1,14 +1,15 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use kudelma_config::{Config, ModelTier, ToolKey};
+use kudelma_config::{Config, ExecutionStrategy, ModelTier, ToolKey};
 use kudelma_permissions::{AgentRole, CoderScope, PermissionManager};
 use kudelma_providers::{
     ChatRequest, ContentBlock, Message, Model, ProviderEvent, all_models, provider_for,
 };
-use kudelma_storage::{ArtifactStore, AuthStore, tasks_dir};
+use kudelma_storage::{ArtifactStore, AuthStore, now_rfc3339, tasks_dir};
 use kudelma_tools::{
     TodoItem, Tool, ToolContext, ToolError, ToolOutput, ToolPermission, ToolRegistry,
     builtin_tools, object_schema,
@@ -28,7 +29,7 @@ pub struct TaskState {
     pub state_dir: PathBuf,
     pub session_id: String,
     pub model: RwLock<Model>,
-    pub auth: Option<AuthStore>,
+    pub auth: RwLock<Option<AuthStore>>,
     pub permissions: Arc<PermissionManager>,
     pub approver: Arc<dyn Approver>,
     pub events: UnboundedSender<AgentEvent>,
@@ -102,6 +103,14 @@ impl Tool for TaskTool {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let state = &self.state;
+        if matches!(
+            state.config.workflow.execution.strategy,
+            ExecutionStrategy::Inline
+        ) {
+            return Err(ToolError::Other(
+                "workflow.execution.strategy=inline disables Coder dispatch".into(),
+            ));
+        }
         let description = args
             .get("description")
             .and_then(Value::as_str)
@@ -174,6 +183,10 @@ impl Tool for TaskTool {
             detail: None,
         });
 
+        let started_at = now_rfc3339();
+        let workspace_before = state.runtime.current_revision().await;
+        let modified = Arc::new(Mutex::new(BTreeSet::new()));
+
         let current = state
             .model
             .read()
@@ -184,7 +197,11 @@ impl Tool for TaskTool {
             .model_for("coder", &current)
             .unwrap_or(current);
         let model = select_model(state, &base, tier);
-        let registry = registry_for(state.allowed_tools.as_ref(), &state.disallowed_tools);
+        let registry = registry_for(
+            state.allowed_tools.as_ref(),
+            &state.disallowed_tools,
+            state.config.agents.coder.allow_shell,
+        );
         let system = format!(
             "{}\n{}",
             crate::prompt::build_subagent_prompt(&state.cwd),
@@ -199,6 +216,7 @@ impl Tool for TaskTool {
         let scope = CoderScope {
             allowed_paths,
             forbidden_paths: string_paths(&args, "forbidden_paths", &state.cwd),
+            allow_shell: state.config.agents.coder.allow_shell,
         };
         let role = AgentRole::Coder;
         let permissions =
@@ -218,18 +236,36 @@ impl Tool for TaskTool {
             prompt,
             ctx,
             &label,
+            state.config.agents.coder.turns(),
+            &format!("{}:coder:{}", state.session_id, task_id),
+            &modified,
         )
         .await;
 
+        let ended_at = now_rfc3339();
+        let workspace_after = state.runtime.current_revision().await;
+        let modified_files: Vec<String> = modified
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned()
+            .collect();
         match result {
             Ok(summary) => {
                 state.runtime.invalidate_verification();
+                if state.config.workflow.execution.review_after_each_task {
+                    state.runtime.require_review_after_worker();
+                }
                 state.runtime.finish_worker(true);
                 let report = WorkerReport {
                     task_id: task_id.clone(),
                     status: WorkerStatus::Completed,
                     summary: summary.clone(),
-                    modified_files: modified_files(&state.cwd).await,
+                    modified_files: modified_files.clone(),
+                    started_at: Some(started_at),
+                    ended_at: Some(ended_at),
+                    workspace_before: Some(workspace_before),
+                    workspace_after: Some(workspace_after),
                     tests: Vec::new(),
                     assumptions: Vec::new(),
                     unresolved_issues: Vec::new(),
@@ -248,11 +284,22 @@ impl Tool for TaskTool {
             }
             Err(error) => {
                 state.runtime.finish_worker(false);
+                let status = if error.contains("blocked by budget") {
+                    WorkerStatus::Blocked
+                } else if error.contains("cancelled") {
+                    WorkerStatus::Cancelled
+                } else {
+                    WorkerStatus::Failed
+                };
                 let report = WorkerReport {
                     task_id: task_id.clone(),
-                    status: WorkerStatus::Failed,
+                    status,
                     summary: error.clone(),
-                    modified_files: modified_files(&state.cwd).await,
+                    modified_files,
+                    started_at: Some(started_at),
+                    ended_at: Some(ended_at),
+                    workspace_before: Some(workspace_before),
+                    workspace_after: Some(workspace_after),
                     tests: Vec::new(),
                     assumptions: Vec::new(),
                     unresolved_issues: vec![error.clone()],
@@ -271,24 +318,6 @@ impl Tool for TaskTool {
             }
         }
     }
-}
-
-async fn modified_files(cwd: &std::path::Path) -> Vec<String> {
-    tokio::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| line[3.min(line.len())..].trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn string_paths(args: &Value, key: &str, base: &std::path::Path) -> Vec<PathBuf> {
@@ -315,20 +344,26 @@ fn select_model(state: &TaskState, current: &Model, tier: Option<ModelTier>) -> 
     let Some(tier) = tier else {
         return current.clone();
     };
-    all_models(&state.config, state.auth.as_ref())
-        .into_iter()
-        .find(|model| {
-            model.provider == current.provider && model.tier == tier && model.supports_tools
-        })
-        .unwrap_or_else(|| current.clone())
+    all_models(
+        &state.config,
+        state
+            .auth
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref(),
+    )
+    .into_iter()
+    .find(|model| model.provider == current.provider && model.tier == tier && model.supports_tools)
+    .unwrap_or_else(|| current.clone())
 }
 
 fn registry_for(
     allowed: Option<&std::collections::HashSet<String>>,
     disallowed: &std::collections::HashSet<String>,
+    allow_shell: bool,
 ) -> ToolRegistry {
     let registry = ToolRegistry::new();
-    let permitted: &[&str] = &[
+    let mut permitted = vec![
         "read",
         "write",
         "edit",
@@ -336,11 +371,13 @@ fn registry_for(
         "grep",
         "ls",
         "index",
-        "bash",
         "todo_write",
         "memory",
         "webfetch",
     ];
+    if allow_shell {
+        permitted.push("bash");
+    }
     for tool in builtin_tools() {
         if !permitted.contains(&tool.name()) || disallowed.contains(tool.name()) {
             continue;
@@ -352,6 +389,10 @@ fn registry_for(
         }
         registry.register(tool);
     }
+    registry.set_policy(kudelma_tools::ToolPolicy::new(
+        allowed.cloned().map(|set| set.into_iter()),
+        disallowed.iter().cloned(),
+    ));
     registry
 }
 
@@ -366,16 +407,22 @@ async fn run_loop(
     prompt: String,
     parent_ctx: &ToolContext,
     label: &str,
+    max_turns: u32,
+    session_id: &str,
+    modified: &Arc<Mutex<BTreeSet<String>>>,
 ) -> Result<String, String> {
     let mut history = vec![Message::user(prompt)];
     let mut last_text = String::new();
-    for _step in 0..25 {
+    for _step in 0..max_turns {
         if state.cancel.is_cancelled() {
             return if last_text.is_empty() {
                 Err("subagent cancelled".into())
             } else {
                 Ok(format!("{last_text}\n[cancelled]"))
             };
+        }
+        if let Some(budget) = state.runtime.budget_blocker() {
+            return Err(format!("blocked by budget: {budget}"));
         }
         let request = ChatRequest {
             messages: history.clone(),
@@ -384,6 +431,7 @@ async fn run_loop(
             max_tokens: 8192.min(model.max_output_tokens),
             temperature: None,
             thinking: None,
+            session_id: Some(session_id.to_string()),
         };
         let provider = provider_for(&model);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -406,6 +454,9 @@ async fn run_loop(
             usage.output_tokens,
             model.cost(usage),
         );
+        if let Some(budget) = state.runtime.budget_blocker() {
+            return Err(format!("blocked by budget: {budget}"));
+        }
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -465,12 +516,21 @@ async fn run_loop(
                 &call,
             )
             .await;
+            if !result.is_error
+                && kudelma_permissions::WRITE_TOOLS.contains(&call.name.as_str())
+                && let Some(path) = call.input.get("path").and_then(Value::as_str)
+            {
+                modified
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(path.to_string());
+            }
             results.push(result);
         }
         history.push(Message::tool_results(results));
     }
     let _ = label;
     Ok(format!(
-        "{last_text}\n[subagent stopped after 25 steps; continue yourself if needed]"
+        "{last_text}\n[subagent stopped after {max_turns} steps; continue yourself if needed]"
     ))
 }

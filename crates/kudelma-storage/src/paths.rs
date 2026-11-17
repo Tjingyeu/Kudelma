@@ -50,6 +50,10 @@ pub fn evidence_dir() -> Result<PathBuf, StorageError> {
     Ok(state_dir()?.join("evidence"))
 }
 
+pub fn reviews_dir() -> Result<PathBuf, StorageError> {
+    Ok(state_dir()?.join("reviews"))
+}
+
 pub fn exploration_dir() -> Result<PathBuf, StorageError> {
     Ok(state_dir()?.join("exploration"))
 }

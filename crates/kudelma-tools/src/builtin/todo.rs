@@ -14,6 +14,10 @@ impl Tool for TodoWriteTool {
         "todo_write"
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &'static str {
         "Replace the session's structured task list. Use it to plan multi-step work and keep progress visible."
     }

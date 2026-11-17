@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -56,7 +56,7 @@ impl Provider for OpenAiProvider {
             for (name, value) in &self.model.headers {
                 builder = builder.header(name, value);
             }
-            builder
+            add_provider_headers(builder, &self.model.provider, request.session_id.as_deref())
         })
         .await?;
 
@@ -175,6 +175,20 @@ impl Provider for OpenAiProvider {
     }
 }
 
+fn add_provider_headers(
+    mut builder: RequestBuilder,
+    provider: &str,
+    session_id: Option<&str>,
+) -> RequestBuilder {
+    if provider == "opencode-go" {
+        builder = builder.header("user-agent", concat!("kudelma/", env!("CARGO_PKG_VERSION")));
+        if let Some(session_id) = session_id {
+            builder = builder.header("x-opencode-session", session_id);
+        }
+    }
+    builder
+}
+
 #[derive(Default)]
 struct ToolAccumulator {
     id: String,
@@ -251,7 +265,7 @@ fn openai_body(model: &Model, request: &ChatRequest) -> Value {
     }
     if matches!(
         model.provider.as_str(),
-        "openai" | "deepseek" | "moonshot" | "openrouter" | "xai"
+        "openai" | "deepseek" | "moonshot" | "openrouter" | "xai" | "opencode-go"
     ) && !reasoning
     {
         body["stream_options"] = json!({ "include_usage": true });
@@ -371,6 +385,7 @@ mod tests {
                     content: "done".into(),
                     is_error: false,
                     name: Some("read".into()),
+                    metadata: None,
                 }]),
             ],
             system: Some("sys".into()),
@@ -382,10 +397,74 @@ mod tests {
             max_tokens: 10,
             temperature: None,
             thinking: None,
+            session_id: None,
         };
         let body = openai_body(&model, &request);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn opencode_go_requests_carry_identity_and_session_headers() {
+        let request = add_provider_headers(
+            Client::new().post("https://opencode.ai/inference/go/openai/v1/chat/completions"),
+            "opencode-go",
+            Some("session-agency-123"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.headers()["x-opencode-session"],
+            "session-agency-123"
+        );
+        assert_eq!(
+            request.headers()["user-agent"],
+            concat!("kudelma/", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn other_providers_do_not_receive_opencode_headers() {
+        let request = add_provider_headers(
+            Client::new().post("https://api.example.invalid/v1/chat/completions"),
+            "openai",
+            Some("session-agency-123"),
+        )
+        .build()
+        .unwrap();
+        assert!(request.headers().get("x-opencode-session").is_none());
+    }
+
+    #[test]
+    fn opencode_go_requests_include_stream_usage() {
+        let model = Model {
+            provider: "opencode-go".into(),
+            id: "glm-5.3-flash".into(),
+            display_name: "glm".into(),
+            context_window: 1000,
+            max_output_tokens: 100,
+            input_cost: 0.0,
+            output_cost: 0.0,
+            tier: crate::ModelTier::Medium,
+            supports_thinking: true,
+            supports_tools: true,
+            kind: kudelma_config::ProviderKind::Openai,
+            base_url: "https://opencode.ai/inference/go/openai/v1".into(),
+            api_key: Some("test".into()),
+            auth_env: "OPENCODE_API_KEY".into(),
+            headers: Default::default(),
+        };
+        let request = ChatRequest {
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: Vec::new(),
+            max_tokens: 10,
+            temperature: None,
+            thinking: None,
+            session_id: Some("session-1".into()),
+        };
+        let body = openai_body(&model, &request);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }

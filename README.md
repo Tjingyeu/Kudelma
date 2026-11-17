@@ -13,7 +13,7 @@ Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)�
 - **Agency**：面向开发者的意图代理。普通问题直接回答；代码问题调用共享只读 **Exploration Capability** 并返回带 `file:symbol:line` 的证据，**不唤醒 Lead、也不启动额外模型**；开发请求经过最小充分澄清后生成版本化 **Task Contract**。
 - **Lead**：唯一技术决策与编排权威，在同一会话内切换 **PLAN / BUILD / DEBUG / REVIEW** 四种模式，可内联实现或派遣 Coder；直接复用同一套确定性探索能力做深度调查。
 - **共享 Exploration Capability**：不是 Agent、没有独立模型或会话。确定性地组合文件发现、Tree-sitter 符号骨架、关键字/引用检索、源码片段、项目记忆与最近运行证据，返回区分 observed fact / inference 的 `ExplorationReport`；由调用方（Agency 或 Lead）用自身模型解释。
-- **Coder**：受限路径与工具的实现 Worker，不能派生子 Agent，返回结构化 Worker Report。
+- **Coder**：受限路径与工具的实现 Worker，不能派生子 Agent，默认**没有 Bash/Verify 入口**，测试由 Lead 统一执行；返回结构化 Worker Report。
 - **Verifier**：非 LLM 确定性子系统。执行 build/test/lint/验收命令，记录命令、工作目录、退出码、起止时间、Git HEAD、diff 哈希与输出日志，生成不可由模型伪造的 `ExecutionEvidence`。
 
 ### 工程工作流与 Skills
@@ -28,7 +28,8 @@ Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)�
 
 - **原生 Rust 单二进制**：无 Node.js / Bun 运行时，毫秒级启动；`ratatui` 交互式 TUI。
 - **多 Provider**：Anthropic Messages、OpenAI Chat Completions 兼容协议、Google Gemini。
-  - 内置 Anthropic、OpenAI、Moonshot Kimi、DeepSeek、Gemini、OpenRouter、xAI、Ollama 预设，支持任意 OpenAI 兼容端点。
+  - 内置 Anthropic、OpenAI、OpenCode Go、Moonshot Kimi、DeepSeek、Gemini、OpenRouter、xAI、Ollama 预设，支持任意 OpenAI 兼容端点。
+  - TUI 中用 `/connect` 连接多个供应商，用 `/models` 在已连接供应商的模型间切换；OpenCode Go 使用订阅 API key。
   - 流式输出、SSE、`Retry-After` 重试、Prompt Cache 断点、Token / 成本核算。
 - **省 Token 的工具链**：
   - `index`：Tree-sitter 提取 Rust / TS / TSX / JS / Python / Go / C / C++ 的符号骨架与行号，先定位再精读。
@@ -37,9 +38,11 @@ Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)�
   - `todo_write`、`memory`、带 SSRF 防护的 `webfetch`。
 - **安全权限模型**：
   - `deny` 优先；工作区读与写默认允许，工作区外询问；`bash` 默认询问。
-  - 三模型能力矩阵由 Rust 权限层强制：Agency 只读，Coder 仅限授权路径，Lead 可编排但不能绕过 deny；`--yolo` 不绕过这些硬边界。
-  - Tree-sitter 拆解复合 Shell 命令（`git status && rm -rf /` → 两个作用域），重定向/替换等高风险形式要求精确批准。
-  - Plan 模式只允许写计划文件；Review 模式默认只读并依赖 Verifier 证据。
+  - 三模型能力矩阵由 Rust 权限层强制：Agency 只读，Coder 仅限授权路径且默认无 Shell，Lead 可编排但不能绕过 deny；`--yolo` 不绕过这些硬边界。
+  - 复杂 Shell、重定向、命令替换和工作区外 `cwd` 需要精确批准；`--yolo` 和 `--allowed-tools bash` 不会替代精确批准，Headless AutoApprover 会拒绝这类请求。
+  - Plan 模式只允许写计划文件，离开 PLAN 前必须存在非空且包含验证方案的计划产物；Review 模式只读，完成前必须提交与当前工作区修订绑定的结构化 `ReviewReport`。
+  - Pre-tool Hook fail-closed：只有退出码 0 放行；退出码 2 明确拒绝，其他非零/启动失败/超时/取消同样拒绝。
+  - 验证证据绑定 `WorkspaceRevision`（Git HEAD、diff/status/untracked 哈希、mutation generation）；验证后工作区变化会使旧证据失效。
   - 未信任目录只生效 `deny` 规则，不加载项目 MCP / hooks / Skills。
 - **会话与上下文**：
   - Agency 与 Lead 会话历史分轨持久化；恢复会话时保留角色、模式、契约和工作流状态。
@@ -57,7 +60,7 @@ Kudelma 的架构参考了 [tontinton/maki](https://github.com/tontinton/maki)�
 
 ## 安装
 
-需要 Rust 1.85+。
+需要 Rust 1.88+。
 
 ```bash
 git clone https://github.com/Tjingyeu/Kudelma.git
@@ -84,6 +87,17 @@ kudelma auth login anthropic
 
 # 查看可用模型与凭据状态
 kudelma models
+
+# 交互式连接供应商（含 OpenCode Go 订阅）
+kudelma models --connect
+# 或直接存储 OpenCode Go API key
+kudelma auth login opencode-go
+
+# 使用 OpenCode Go 模型快速测试
+kudelma -p --model opencode-go/kimi-k2.7-code "解释当前项目的目录结构"
+
+# 未列入内置目录的其他 Go 模型也可以直接指定
+kudelma -p --model opencode-go/deepseek-v4.1-flash "检查这个错误"
 
 # 在当前项目启动 TUI（默认先由 Agency 理解意图）
 cd your-project
@@ -144,15 +158,23 @@ bash_timeout_secs = 120
 mcp_defer_threshold = 15
 
 [agency]
+# provider = "opencode-go"
+# model = "glm-5.3-flash"
 max_turns = 10
 max_clarification_rounds = 8
 
 [lead]
+# provider = "opencode-go"
+# model = "kimi-k2.7-code"
 max_turns = 40
 max_children = 4
 
 [agents.coder]
+# provider = "opencode-go"
+# model = "kimi-k2.7-code"
 max_turns = 25
+# 默认 false：Coder 没有 Bash/Verify。开启任意 Shell 会失去文件写入硬隔离保证。
+allow_shell = false
 
 # 共享只读探索：确定性检索，没有独立模型。
 [exploration]
@@ -169,7 +191,7 @@ default = "adaptive"          # adaptive | feature | bug_fix | refactor | simple
 require_review = true
 require_verification = true
 require_spec_approval = "risk_based"
-require_plan_approval = "risk_based"
+require_plan_approval = "risk_based"   # "always" 尚未接入审批 UI；doctor 会提示
 verification_commands = ["cargo test --workspace"]
 
 [workflow.execution]
@@ -241,6 +263,9 @@ kudelma --trust            # 仅本次运行信任
 | 行为 | 默认 |
 | --- | --- |
 | Agency 写文件、执行 Shell、派发 Coder、调用 MCP | 总是拒绝（`--yolo` 也不行） |
+| Coder 默认调用 `bash` / `verify` | 总是拒绝；开启 `agents.coder.allow_shell` 后才进入普通权限判断 |
+| Review 模式写文件 / 普通 Bash / Task / Memory / MCP | 总是拒绝；受控 Verify 可用，但 Bash deny 仍生效 |
+| Plan 模式写非计划文件 / 命令 / MCP / Task | 总是拒绝；离开 PLAN 需要合法计划产物 |
 | Agency / Lead 使用共享探索读取工作区外路径 | 询问 |
 | Coder 调用 `explore_codebase` | 总是拒绝 |
 | Coder 写 `allowed_paths` 之外或 `forbidden_paths` 内 | 总是拒绝 |
@@ -278,7 +303,9 @@ TUI 权限弹窗：
 | `PageUp` / `PageDown` | 滚动 |
 | `Ctrl+C` | 退出 |
 
-内置命令：`/help`、`/new`、`/sessions`、`/resume`、`/model`、`/mode`、`/contract`、`/workflow`、`/skills`、`/verify`、`/compact`、`/usage`、`/tasks`、`/rewind`、`/clear`、`/cd`、`/init`、`/quit`。
+内置命令：`/help`、`/new`、`/sessions`、`/resume`、`/connect`、`/models`、`/model`、`/mode`、`/contract`、`/workflow`、`/skills`、`/verify`、`/compact`、`/usage`、`/tasks`、`/rewind`、`/clear`、`/cd`、`/init`、`/quit`。
+
+`/connect` 选择供应商并输入 API key（输入隐藏，不写入会话）；`/models` 只列出已连接供应商的模型，按 `c` 可直接连接新的供应商。连接成功后当前 Agency/Lead 会使用该凭据，无需重启 TUI。
 
 TUI 顶部状态栏显示：当前角色（`agency` / `lead`）、Lead 模式（`PLAN/BUILD/DEBUG/REVIEW`）、模型、工作流阶段与 Gate 进度、上下文占用和成本。发生迁移时显示原因，例如 `BUILD -> DEBUG: verification failed`。
 
@@ -296,7 +323,7 @@ kudelma <COMMAND>
 
 Commands:
   auth     管理凭据 (login/logout/status)
-  models   列出模型、上下文与价格
+  models   列出模型、上下文与价格；`models --connect` 交互式连接供应商
   session  会话列表/删除/导出/导入
   skill    技能列表/检视/启用/禁用
   workflow 工作流预设、运行状态、恢复
@@ -404,7 +431,12 @@ cargo test --workspace
 
 - 目前 `WorkspaceEnv` 的实现是本地文件系统；接口已预留 SSH / 容器远端执行。
 - 图片输入在协议层已建模，CLI 尚未暴露附件参数。
-- Coder 调度当前按任务顺序执行；`max_parallel_coders` 已进入配置与 Ledger，但并行 worktree 编排仍在演进。
+- Coder 调度当前按任务顺序执行；`max_parallel_coders` 为 reserved，并行 worktree 编排尚未实现，`doctor` 会给出警告。
+- `fresh_coder_per_task = false` 与 `exploration.max_investigation_rounds` 目前为 reserved，`doctor` 会明确提示。
+- `workflow.require_plan_approval = always` 尚未接入独立审批 UI；计划产物仍会被校验，`doctor` 会提示该限制。
+- 真实 OpenCode Go endpoint 需要有效订阅 key 才能完成真实模型 smoke test。
+- Exploration 与项目指令加载当前使用本地文件系统；`WorkspaceEnv` 的远端实现尚未落地。远端/非 Git 环境的 revision 证据限制仍未完全抽象。
+- 后台 Bash 任务由 Agent 计数并阻止最终完成；未经过 Agent 的外部进程变更仍由 `WorkspaceRevision` 复核兜底。
 - MCP OAuth、Lua 插件热加载与 Web 搜索尚未内置；MCP stdio/HTTP、Skills、Workflow、Hooks 与 ACP 已可用。
 - TDD Gate 已建模；当前基线通过 `verify` 的测试/构建证据完成验证，RED/GREEN 的细粒度自动判定可继续增强。
 - 模型价格与上下文窗口为内置目录数据，可通过 `[providers.*.models]` 覆盖。

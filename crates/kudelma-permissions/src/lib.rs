@@ -42,10 +42,31 @@ impl AgentRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Plan,
+    Build,
+    Debug,
+    Review,
+}
+
+impl PermissionMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Build => "build",
+            Self::Debug => "debug",
+            Self::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CoderScope {
     pub allowed_paths: Vec<PathBuf>,
     pub forbidden_paths: Vec<PathBuf>,
+    pub allow_shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +77,7 @@ pub enum PermissionCheck {
         tool: ToolKey,
         scopes: Vec<Scope>,
         reason: Option<String>,
+        requires_exact: bool,
     },
 }
 
@@ -143,6 +165,7 @@ pub struct PermissionManager {
     global_file: PathBuf,
     pub role: AgentRole,
     pub coder_scope: CoderScope,
+    pub mode: RwLock<PermissionMode>,
 }
 
 impl PermissionManager {
@@ -176,6 +199,7 @@ impl PermissionManager {
             global_file: kudelma_config::global_config_path(),
             role: AgentRole::Lead,
             coder_scope: CoderScope::default(),
+            mode: RwLock::new(PermissionMode::Build),
         }
     }
 
@@ -198,6 +222,7 @@ impl PermissionManager {
             global_file: cwd.join(".kudelma/global.toml"),
             role: AgentRole::Lead,
             coder_scope: CoderScope::default(),
+            mode: RwLock::new(PermissionMode::Build),
         }
     }
 
@@ -219,7 +244,21 @@ impl PermissionManager {
             global_file: self.global_file.clone(),
             role,
             coder_scope,
+            mode: RwLock::new(*self.mode.read().unwrap_or_else(|error| error.into_inner())),
         }
+    }
+
+    pub fn for_mode(&self, mode: PermissionMode) -> Self {
+        let manager = self.for_role(self.role, self.coder_scope.clone());
+        *manager
+            .mode
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = mode;
+        *manager
+            .plan_path
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = self.plan_path();
+        manager
     }
 
     pub fn cwd(&self) -> &Path {
@@ -247,6 +286,14 @@ impl PermissionManager {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        *self.mode.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.write().unwrap_or_else(|error| error.into_inner()) = mode;
     }
 
     pub fn session_rules(&self) -> Vec<PermissionRule> {
@@ -286,10 +333,20 @@ impl PermissionManager {
         scopes: &[Scope],
         force_prompt: bool,
     ) -> PermissionCheck {
+        self.check_with_context(tool, scopes, force_prompt, None)
+    }
+
+    pub fn check_with_context(
+        &self,
+        tool: &ToolKey,
+        scopes: &[Scope],
+        force_prompt: bool,
+        cwd: Option<&Path>,
+    ) -> PermissionCheck {
         if scopes.is_empty() {
-            return self.check_scopes(tool, &[Scope::exact("")], force_prompt);
+            return self.check_scopes(tool, &[Scope::exact("")], force_prompt, cwd);
         }
-        self.check_scopes(tool, scopes, force_prompt)
+        self.check_scopes(tool, scopes, force_prompt, cwd)
     }
 
     fn check_scopes(
@@ -297,14 +354,16 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &[Scope],
         force_prompt: bool,
+        cwd: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules.read().unwrap_or_else(|e| e.into_inner());
         let all_rules = || session.iter().chain(self.rules.iter());
+        let rule_key = rule_key_for(tool);
 
         for scope in scopes {
             for rule in all_rules() {
                 if rule.effect == Effect::Deny
-                    && reaches(&rule.tool, tool)
+                    && reaches(&rule.tool, &rule_key)
                     && rule_matches(rule, scope)
                 {
                     return PermissionCheck::Denied(match &rule.scope {
@@ -321,41 +380,74 @@ impl PermissionManager {
             return PermissionCheck::Denied(reason);
         }
 
-        let plan = self.plan_path();
-        if let Some(plan_path) = &plan {
+        let mode = self.mode();
+        if matches!(tool, ToolKey::Native(name) if name == "submit_review")
+            && mode != PermissionMode::Review
+        {
+            return PermissionCheck::Denied(
+                "submit_review is only available in review mode".into(),
+            );
+        }
+        if mode == PermissionMode::Plan {
             if is_write_tool(tool) {
-                let normalized_plan = canonicalize_lenient(plan_path);
-                let all_plan = scopes
-                    .iter()
-                    .all(|scope| canonicalize_lenient(Path::new(&scope.value)) == normalized_plan);
+                let plan = self.plan_path();
+                let all_plan = plan.is_some_and(|path| {
+                    let normalized = canonicalize_lenient(&path);
+                    scopes
+                        .iter()
+                        .all(|scope| canonicalize_lenient(Path::new(&scope.value)) == normalized)
+                });
                 if all_plan {
                     return PermissionCheck::Allowed;
                 }
-                return PermissionCheck::NeedsPrompt {
-                    tool: tool.clone(),
-                    scopes: scopes.to_vec(),
-                    reason: Some("plan mode only allows writing the plan file".into()),
-                };
+                return PermissionCheck::Denied(
+                    "plan mode only allows writing the plan file".into(),
+                );
             }
-            if is_bash(tool) || tool.is_mcp() {
-                return PermissionCheck::NeedsPrompt {
-                    tool: tool.clone(),
-                    scopes: scopes.to_vec(),
-                    reason: Some("plan mode asks before running commands or MCP tools".into()),
-                };
+            if is_bash(tool) || is_verify(tool) || tool.is_mcp() || is_task(tool) || is_memory(tool)
+            {
+                return PermissionCheck::Denied(
+                    "plan mode is read-only: commands, MCP, task dispatch and memory writes are blocked"
+                        .into(),
+                );
+            }
+        }
+        if mode == PermissionMode::Review {
+            if is_write_tool(tool)
+                || is_bash(tool)
+                || tool.is_mcp()
+                || is_task(tool)
+                || is_memory(tool)
+            {
+                return PermissionCheck::Denied(
+                    "review mode is read-only: code edits, shell, MCP, task dispatch and memory writes are blocked"
+                        .into(),
+                );
+            }
+            if is_verify(tool) {
+                return PermissionCheck::Allowed;
             }
         }
 
-        if self.yolo {
-            return PermissionCheck::Allowed;
+        if let Some(cwd) = cwd
+            && (is_bash(tool) || is_verify(tool))
+            && !is_within(&self.cwd, cwd)
+        {
+            return PermissionCheck::NeedsPrompt {
+                tool: tool.clone(),
+                scopes: scopes.to_vec(),
+                reason: Some("working directory is outside the workspace".into()),
+                requires_exact: true,
+            };
         }
 
         let mut pending = Vec::new();
         for scope in scopes {
             let allowed = all_rules().any(|rule| {
                 rule.effect == Effect::Allow
-                    && reaches(&rule.tool, tool)
+                    && reaches(&rule.tool, &rule_key)
                     && rule_matches(rule, scope)
+                    && !(force_prompt && rule.scope.is_none())
             });
             if !allowed {
                 pending.push(scope.clone());
@@ -373,8 +465,12 @@ impl PermissionManager {
             return PermissionCheck::NeedsPrompt {
                 tool: tool.clone(),
                 scopes: pending,
-                reason: Some("command uses shell metacharacters; approve it exactly".into()),
+                reason: Some("command requires exact approval".into()),
+                requires_exact: true,
             };
+        }
+        if self.yolo {
+            return PermissionCheck::Allowed;
         }
 
         if let Some(check) = self.builtin_check(tool, &pending) {
@@ -390,6 +486,7 @@ impl PermissionManager {
                 tool: tool.clone(),
                 scopes: pending,
                 reason: None,
+                requires_exact: false,
             },
         }
     }
@@ -408,8 +505,14 @@ impl PermissionManager {
                 "lead_mode" if self.role != AgentRole::Lead => {
                     return Some("only lead may change the lead mode".into());
                 }
-                "verify" if !matches!(self.role, AgentRole::Lead | AgentRole::Coder) => {
-                    return Some("only lead and coder may run verification".into());
+                "submit_review" if self.role != AgentRole::Lead => {
+                    return Some("only lead may submit a review report".into());
+                }
+                "verify"
+                    if !matches!(self.role, AgentRole::Lead)
+                        && !(self.role == AgentRole::Coder && self.coder_scope.allow_shell) =>
+                {
+                    return Some("only lead may run verification".into());
                 }
                 _ => {}
             }
@@ -429,6 +532,12 @@ impl PermissionManager {
             AgentRole::Coder => {
                 if matches!(tool, ToolKey::Native(name) if name == "task") {
                     return Some("coder cannot dispatch agents".into());
+                }
+                if (is_bash(tool) || is_verify(tool)) && !self.coder_scope.allow_shell {
+                    return Some(
+                        "coder shell and command execution are disabled by default; Lead must run verification"
+                            .into(),
+                    );
                 }
                 if !is_write_tool(tool) {
                     return None;
@@ -477,6 +586,7 @@ impl PermissionManager {
                     tool: tool.clone(),
                     scopes: scopes.to_vec(),
                     reason: Some("path is outside the workspace".into()),
+                    requires_exact: false,
                 }
             });
         }
@@ -491,10 +601,14 @@ impl PermissionManager {
                     tool: tool.clone(),
                     scopes: scopes.to_vec(),
                     reason: Some("write is outside the workspace".into()),
+                    requires_exact: false,
                 }
             });
         }
-        if matches!(name.as_str(), "skill" | "lead_mode" | "submit_contract") {
+        if matches!(
+            name.as_str(),
+            "skill" | "lead_mode" | "submit_contract" | "submit_review"
+        ) {
             return Some(PermissionCheck::Allowed);
         }
         if matches!(name.as_str(), "todo_write" | "memory" | "task") {
@@ -526,10 +640,11 @@ impl PermissionManager {
             Effect::Deny
         };
         let mut rules = Vec::new();
+        let rule_key = rule_key_for(tool);
         for scope in scopes {
-            let value = generalize(tool, scope);
+            let value = generalize(&rule_key, scope);
             rules.push(PermissionRule {
-                tool: tool.clone(),
+                tool: rule_key.clone(),
                 scope: Some(value),
                 effect,
             });
@@ -570,6 +685,26 @@ fn is_write_tool(tool: &ToolKey) -> bool {
 
 fn is_bash(tool: &ToolKey) -> bool {
     matches!(tool, ToolKey::Native(name) if name == "bash")
+}
+
+fn is_verify(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if name == "verify")
+}
+
+fn is_task(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if name == "task")
+}
+
+fn is_memory(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if name == "memory")
+}
+
+fn rule_key_for(tool: &ToolKey) -> ToolKey {
+    if is_verify(tool) {
+        ToolKey::native("bash")
+    } else {
+        tool.clone()
+    }
 }
 
 fn reaches(rule: &ToolKey, actual: &ToolKey) -> bool {
@@ -716,7 +851,7 @@ mod tests {
 
     #[test]
     fn plan_mode_allows_only_the_plan_file() {
-        let manager = manager(DefaultEffect::Allow, vec![]);
+        let manager = manager(DefaultEffect::Allow, vec![]).for_mode(PermissionMode::Plan);
         manager.set_plan_path(Some(PathBuf::from("/work/plan.md")));
         let allowed = manager.check(&ToolKey::native("write"), &[Scope::path("/work/plan.md")]);
         assert_eq!(allowed, PermissionCheck::Allowed);
@@ -724,7 +859,68 @@ mod tests {
             &ToolKey::native("write"),
             &[Scope::path("/work/src/main.rs")],
         );
-        assert!(matches!(denied, PermissionCheck::NeedsPrompt { .. }));
+        assert!(matches!(denied, PermissionCheck::Denied(_)));
+        assert!(matches!(
+            manager.check(&ToolKey::native("bash"), &[Scope::command("cargo test")]),
+            PermissionCheck::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn review_is_read_only_but_allows_verification() {
+        let manager = manager(DefaultEffect::Allow, vec![]).for_mode(PermissionMode::Review);
+        assert!(matches!(
+            manager.check(
+                &ToolKey::native("edit"),
+                &[Scope::path("/work/src/main.rs")]
+            ),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("bash"), &[Scope::command("cargo test")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            manager.check(&ToolKey::native("task"), &[Scope::exact("task:x")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert_eq!(
+            manager.check(
+                &ToolKey::native("read"),
+                &[Scope::path("/work/src/main.rs")]
+            ),
+            PermissionCheck::Allowed
+        );
+        assert_eq!(
+            manager.check(&ToolKey::native("verify"), &[Scope::command("cargo test")]),
+            PermissionCheck::Allowed
+        );
+        assert_eq!(
+            manager.check(&ToolKey::native("submit_review"), &[Scope::exact("review")]),
+            PermissionCheck::Allowed
+        );
+        let build = manager.for_mode(PermissionMode::Build);
+        assert!(matches!(
+            build.check(&ToolKey::native("submit_review"), &[Scope::exact("review")]),
+            PermissionCheck::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn review_mode_still_honors_bash_deny_for_verify() {
+        let manager = manager(
+            DefaultEffect::Allow,
+            vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("cargo test".into()),
+                effect: Effect::Deny,
+            }],
+        )
+        .for_mode(PermissionMode::Review);
+        assert!(matches!(
+            manager.check(&ToolKey::native("verify"), &[Scope::command("cargo test")]),
+            PermissionCheck::Denied(_)
+        ));
     }
 
     #[test]
@@ -745,9 +941,33 @@ mod tests {
     }
 
     #[test]
-    fn yolo_still_allows_redirection_commands() {
+    fn yolo_does_not_bypass_exact_shell_approval() {
         let mut manager = manager(DefaultEffect::Prompt, vec![]);
         manager.set_yolo(true);
+        let check = manager.check_with_force(
+            &ToolKey::native("bash"),
+            &[Scope::exact("echo hi > out.txt")],
+            true,
+        );
+        assert!(matches!(
+            check,
+            PermissionCheck::NeedsPrompt {
+                requires_exact: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_allow_rule_permits_the_full_command() {
+        let manager = manager(
+            DefaultEffect::Prompt,
+            vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("echo hi > out.txt".into()),
+                effect: Effect::Allow,
+            }],
+        );
         assert_eq!(
             manager.check(
                 &ToolKey::native("bash"),
@@ -755,6 +975,41 @@ mod tests {
             ),
             PermissionCheck::Allowed
         );
+    }
+
+    #[test]
+    fn allowed_tools_bash_does_not_bypass_exact_approval() {
+        let manager = manager(DefaultEffect::Prompt, vec![]);
+        manager.allow_tool_for_session("bash");
+        let check = manager.check_with_force(
+            &ToolKey::native("bash"),
+            &[Scope::exact("echo hi > out.txt")],
+            true,
+        );
+        assert!(matches!(
+            check,
+            PermissionCheck::NeedsPrompt {
+                requires_exact: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bash_cwd_outside_the_workspace_requires_exact_approval() {
+        let manager = manager(DefaultEffect::Allow, vec![]);
+        assert!(matches!(
+            manager.check_with_context(
+                &ToolKey::native("bash"),
+                &[Scope::command("ls")],
+                false,
+                Some(Path::new("/etc"))
+            ),
+            PermissionCheck::NeedsPrompt {
+                requires_exact: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -818,6 +1073,7 @@ mod tests {
             CoderScope {
                 allowed_paths: vec![PathBuf::from("/work/src")],
                 forbidden_paths: vec![PathBuf::from("/work/src/secret")],
+                allow_shell: false,
             },
         );
         assert_eq!(
@@ -842,5 +1098,35 @@ mod tests {
             manager.check(&ToolKey::native("task"), &[Scope::exact("task:x")]),
             PermissionCheck::Denied(_)
         ));
+    }
+
+    #[test]
+    fn coder_shell_and_verify_are_denied_even_under_yolo() {
+        let mut base = manager(DefaultEffect::Allow, vec![]);
+        base.set_yolo(true);
+        let coder = base.for_role(AgentRole::Coder, CoderScope::default());
+        assert!(matches!(
+            coder.check(&ToolKey::native("bash"), &[Scope::command("cargo test")]),
+            PermissionCheck::Denied(_)
+        ));
+        assert!(matches!(
+            coder.check(&ToolKey::native("verify"), &[Scope::command("cargo test")]),
+            PermissionCheck::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn coder_can_run_shell_only_with_the_explicit_scope_flag() {
+        let coder = manager(DefaultEffect::Allow, vec![]).for_role(
+            AgentRole::Coder,
+            CoderScope {
+                allow_shell: true,
+                ..CoderScope::default()
+            },
+        );
+        assert_eq!(
+            coder.check(&ToolKey::native("bash"), &[Scope::command("cargo test")]),
+            PermissionCheck::Allowed
+        );
     }
 }

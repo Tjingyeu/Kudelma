@@ -47,11 +47,14 @@ impl Tool for BashTool {
         let reason = analysis
             .force_prompt
             .then(|| "command contains redirections or shell metacharacters".to_string());
-        let _ = ctx;
+        let cwd = optional_str(args, "cwd")
+            .map(|cwd| ctx.env.resolve(&cwd))
+            .unwrap_or_else(|| ctx.cwd().to_path_buf());
         Ok(ToolPermission {
             scopes: analysis.scopes,
             force_prompt: analysis.force_prompt,
             reason,
+            cwd: Some(cwd),
         })
     }
 
@@ -82,7 +85,8 @@ impl Tool for BashTool {
             spawn_background(child, label.clone(), timeout_secs, sender);
             return Ok(ToolOutput::success(format!(
                 "Started in the background: {label}\nA completion notice will arrive after the turn."
-            )));
+            ))
+            .with_metadata(json!({ "background": true })));
         }
 
         let pid = child.id();
@@ -144,7 +148,8 @@ impl Tool for BashTool {
             return Ok(ToolOutput::success(format!(
                 "Moved to the background after {}s. The result will arrive as a notice.",
                 timeout_secs
-            )));
+            ))
+            .with_metadata(json!({ "background": true })));
         }
 
         let timed_out = matches!(outcome, Outcome::Timeout);

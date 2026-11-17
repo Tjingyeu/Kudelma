@@ -276,8 +276,8 @@ Agency and Lead invoke the same underlying capability with different caller cont
 - Read relevant files and project instructions.
 - Edit only authorized paths and files.
 - Follow applicable implementation Skills, including TDD where appropriate.
-- Run explicitly authorized tests and checks.
-- Return a structured Worker Report with changed files, tests, unresolved issues, assumptions, and evidence references.
+- Report the commands that Lead should run; by default Coder has no Bash/Verify entry.
+- Return a structured Worker Report with actual changed files, tests (only if actually run), unresolved issues, assumptions, and evidence references.
 
 #### Restrictions
 
@@ -783,7 +783,7 @@ The existing `kudelma-permissions` crate remains the single enforcement point.
 | Read project files | bounded | yes | yes | bounded |
 | Shared read-only exploration | yes, bounded | yes | task-scoped reads | no direct orchestration |
 | Write/edit project files | no | policy-controlled | scoped | no |
-| Shell/Bash | no by default | policy-controlled | approved/scoped | controlled command set |
+| Shell/Bash | no by default | policy-controlled | no by default; explicit unsafe opt-in | controlled command set |
 | External fetch | optional/policy | yes if enabled | normally no | no |
 | MCP | read-only subset, if enabled | policy-controlled | task-specific subset | no by default |
 | Dispatch Coder | no | yes | no | no |

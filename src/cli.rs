@@ -130,6 +130,9 @@ pub enum Command {
         /// Accepted for compatibility; the catalog is built in
         #[arg(long)]
         refresh: bool,
+        /// Interactively connect an API-key provider
+        #[arg(long)]
+        connect: bool,
     },
     /// Manage saved sessions
     Session {
@@ -180,7 +183,7 @@ pub enum Command {
 pub enum AuthAction {
     /// Store an API key for a provider
     Login {
-        /// Provider slug, e.g. anthropic, openai, moonshot
+        /// Provider slug, e.g. anthropic, openai, opencode-go, moonshot
         provider: Option<String>,
     },
     /// Remove a stored API key

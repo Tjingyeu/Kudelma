@@ -130,6 +130,10 @@ pub struct CoderRoleConfig {
     pub model: Option<String>,
     pub max_turns: u32,
     pub can_spawn: bool,
+    /// Explicit opt-in for shell execution. Disabled by default because a
+    /// shell can write outside `allowed_paths`; enabling it removes the file
+    /// isolation guarantee unless the OS sandbox enforces it.
+    pub allow_shell: bool,
 }
 
 impl CoderRoleConfig {

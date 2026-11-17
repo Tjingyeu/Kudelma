@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::verification::WorkspaceRevision;
+
 pub use super::EvidenceCite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,6 +10,7 @@ pub enum WorkerStatus {
     Completed,
     Partial,
     Blocked,
+    Cancelled,
     Failed,
 }
 
@@ -62,6 +65,14 @@ pub struct WorkerReport {
     pub status: WorkerStatus,
     pub summary: String,
     pub modified_files: Vec<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub workspace_before: Option<WorkspaceRevision>,
+    #[serde(default)]
+    pub workspace_after: Option<WorkspaceRevision>,
     pub tests: Vec<TestRun>,
     pub assumptions: Vec<String>,
     pub unresolved_issues: Vec<String>,

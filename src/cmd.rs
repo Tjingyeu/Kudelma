@@ -25,7 +25,7 @@ use crate::headless::{HeadlessOptions, check_credentials};
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => auth(action).await,
-        Some(Command::Models { .. }) => models(),
+        Some(Command::Models { connect, .. }) => models(connect),
         Some(Command::Session { action }) => sessions(action).await,
         Some(Command::Skill { action }) => skills_command(action),
         Some(Command::Workflow { action }) => workflows_command(action).await,
@@ -59,20 +59,39 @@ async fn run_default(cli: Cli) -> Result<()> {
         None
     };
 
+    let direct_lead = cli.direct_lead || cli.mode.is_some() || cli.plan;
+    let initial_lead = direct_lead
+        || resume
+            .as_ref()
+            .is_some_and(|session| session.meta.active_role == "lead");
     let model_spec = cli
         .model
         .clone()
-        .or_else(|| resume.as_ref().map(|session| session.meta.model.clone()))
+        .or_else(|| {
+            resume.as_ref().map(|session| {
+                if initial_lead {
+                    if session.meta.lead_model.is_empty() {
+                        session.meta.model.clone()
+                    } else {
+                        session.meta.lead_model.clone()
+                    }
+                } else if session.meta.agency_model.is_empty() {
+                    session.meta.model.clone()
+                } else {
+                    session.meta.agency_model.clone()
+                }
+            })
+        })
+        .or_else(|| config.role_model_spec(if initial_lead { "lead" } else { "agency" }))
         .unwrap_or_else(|| config.default_model.clone());
     let model = resolve_model(&config, auth.as_ref(), &model_spec)?;
-    if !matches!(cli.command, Some(Command::Models { .. })) {
-        check_credentials(&model)?;
-    }
 
     let stdin_tty = std::io::stdin().is_terminal();
     let stdout_tty = std::io::stdout().is_terminal();
     let interactive = !cli.print && stdout_tty && (stdin_tty || cli.prompt.is_some());
-    let direct_lead = cli.direct_lead || cli.mode.is_some() || cli.plan;
+    if !interactive && !matches!(cli.command, Some(Command::Models { .. })) {
+        check_credentials(&model)?;
+    }
 
     if interactive {
         let params = kudelma_tui::TuiParams {
@@ -398,15 +417,36 @@ fn parse_workflow(raw: &str) -> WorkflowPreset {
     }
 }
 
+fn provider_display_name(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "opencode-go" => "OpenCode Go",
+        "moonshot" => "Moonshot",
+        "deepseek" => "DeepSeek",
+        "gemini" => "Google Gemini",
+        "openrouter" => "OpenRouter",
+        "xai" => "xAI",
+        "ollama" => "Ollama",
+        _ => "Custom provider",
+    }
+}
+
 async fn auth(action: AuthAction) -> Result<()> {
     match action {
         AuthAction::Login { provider } => {
             let provider = match provider {
                 Some(provider) => provider,
                 None => {
-                    println!(
-                        "Providers: anthropic, openai, moonshot, deepseek, gemini, openrouter"
-                    );
+                    let providers = builtin_providers();
+                    println!("Providers:");
+                    for preset in &providers {
+                        println!(
+                            "  {:<16} {}",
+                            preset.name,
+                            provider_display_name(preset.name)
+                        );
+                    }
                     print!("Provider: ");
                     std::io::stdout().flush()?;
                     let mut line = String::new();
@@ -438,17 +478,28 @@ async fn auth(action: AuthAction) -> Result<()> {
         }
         AuthAction::Status => {
             let store = AuthStore::load()?;
+            let presets = builtin_providers();
+            let mut rows: Vec<(String, String)> = presets
+                .iter()
+                .map(|preset| (preset.name.to_string(), preset.api_key_env.to_string()))
+                .collect();
+            for provider in store.providers() {
+                if !presets.iter().any(|preset| preset.name == provider) {
+                    rows.push((provider.to_string(), "KUDELMA_API_KEY".into()));
+                }
+            }
+            rows.sort();
             println!("{:<12} {:<24} STORED", "PROVIDER", "ENVIRONMENT");
-            for preset in builtin_providers() {
-                let env = std::env::var(preset.api_key_env)
+            for (provider, env_name) in rows {
+                let env = std::env::var(&env_name)
                     .ok()
                     .filter(|value| !value.is_empty())
                     .is_some();
-                let stored = store.get(preset.name).is_some();
+                let stored = store.get(&provider).is_some();
                 println!(
                     "{:<12} {:<24} {}",
-                    preset.name,
-                    preset.api_key_env,
+                    provider,
+                    env_name,
                     if stored {
                         "yes"
                     } else if env {
@@ -463,35 +514,84 @@ async fn auth(action: AuthAction) -> Result<()> {
     Ok(())
 }
 
-fn models() -> Result<()> {
+fn models(connect: bool) -> Result<()> {
     let cwd = canonicalize_lenient(&std::env::current_dir()?);
     let trusted = TrustStore::load()
         .map(|store| store.is_trusted(&cwd))
         .unwrap_or(false);
     let config = Config::load_with_trust(&cwd, trusted)?;
-    let auth = AuthStore::load().ok();
-    let models = all_models(&config, auth.as_ref());
+    let mut auth = AuthStore::load()?;
+    if connect {
+        if !std::io::stdin().is_terminal() {
+            bail!("`kudelma models --connect` requires an interactive terminal");
+        }
+        let presets = builtin_providers();
+        println!("Connect a provider (its API key is stored in the private auth store):");
+        for (index, preset) in presets.iter().enumerate() {
+            println!(
+                "  {:>2}. {:<16} {}{}",
+                index + 1,
+                preset.name,
+                provider_display_name(preset.name),
+                if auth.get(preset.name).is_some() {
+                    " · connected"
+                } else {
+                    ""
+                }
+            );
+        }
+        print!("Provider number or id: ");
+        std::io::stdout().flush()?;
+        let mut selection = String::new();
+        std::io::stdin().read_line(&mut selection)?;
+        let selection = selection.trim();
+        let provider = selection
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| presets.get(index).map(|preset| preset.name))
+            .or_else(|| {
+                presets
+                    .iter()
+                    .find(|preset| preset.name == selection)
+                    .map(|preset| preset.name)
+            })
+            .ok_or_else(|| color_eyre::eyre::eyre!("unknown provider selection `{selection}`"))?;
+        let key = rpassword::prompt_password(format!(
+            "API key for {}: ",
+            provider_display_name(provider)
+        ))?;
+        if key.trim().is_empty() {
+            bail!("empty API key");
+        }
+        auth.set(provider, key.trim())?;
+        println!("Connected {}.", provider_display_name(provider));
+        println!("Select a model with: kudelma --model {provider}/<model-id>");
+        return Ok(());
+    }
+    let models = all_models(&config, Some(&auth));
     if models.is_empty() {
         bail!("no models available");
     }
     println!(
-        "{:<44} {:>9} {:>9} {:>9}  AUTH",
+        "{:<44} {:>9} {:>9} {:>9}  PROVIDER STATUS",
         "MODEL", "CONTEXT", "IN $/M", "OUT $/M"
     );
     for model in models {
         let auth = if model.api_key.is_some() {
-            "key"
+            "connected"
         } else if model.base_url.contains("localhost") || model.base_url.contains("127.0.0.1") {
             "local"
         } else {
-            "missing"
+            "connect"
         };
         println!(
-            "{:<44} {:>9} {:>9.2} {:>9.2}  {}",
+            "{:<44} {:>9} {:>9.2} {:>9.2}  {:<12} {}",
             model.spec(),
             model.context_window,
             model.input_cost,
             model.output_cost,
+            model.provider,
             auth
         );
     }
@@ -729,6 +829,47 @@ fn mcp() -> Result<()> {
     Ok(())
 }
 
+fn config_warnings(config: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !config.workflow.execution.fresh_coder_per_task {
+        warnings.push(
+            "workflow.execution.fresh_coder_per_task=false is not supported; every Coder gets a fresh context"
+                .into(),
+        );
+    }
+    if matches!(
+        config.workflow.execution.strategy,
+        kudelma_config::ExecutionStrategy::SubagentDriven
+    ) {
+        warnings.push(
+            "workflow.execution.strategy=subagent_driven is advisory: Lead still decides whether Coder delegation is appropriate"
+                .into(),
+        );
+    }
+    if config.workflow.execution.max_parallel_coders > 1 {
+        warnings.push(
+            "workflow.execution.max_parallel_coders is reserved: worktree isolation and parallel Coder scheduling are not implemented"
+                .into(),
+        );
+    }
+    if config.exploration.max_investigation_rounds > 0 {
+        warnings.push(
+            "exploration.max_investigation_rounds is reserved: exploration is a single bounded deterministic pass"
+                .into(),
+        );
+    }
+    if matches!(
+        config.workflow.require_plan_approval,
+        kudelma_config::ApprovalPolicy::Always
+    ) {
+        warnings.push(
+            "workflow.require_plan_approval=always is not fully wired to an approval UI; plan artifacts are still validated"
+                .into(),
+        );
+    }
+    warnings
+}
+
 fn doctor() -> Result<()> {
     println!("Kudelma {}", env!("CARGO_PKG_VERSION"));
     println!("cwd:        {}", std::env::current_dir()?.display());
@@ -761,6 +902,9 @@ fn doctor() -> Result<()> {
         .map(|store| store.is_trusted(&cwd))
         .unwrap_or(false);
     let config = Config::load_with_trust(&cwd, trusted)?;
+    for warning in config_warnings(&config) {
+        println!("warning:    {warning}");
+    }
     match resolve_model(&config, Some(&store), &config.default_model) {
         Ok(model) => {
             println!("model:      {}", model.spec());

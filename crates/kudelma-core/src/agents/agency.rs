@@ -1,23 +1,34 @@
 use std::sync::Arc;
 
 use kudelma_permissions::{AgentRole, CoderScope, PermissionManager};
+use kudelma_providers::resolve_model;
 use kudelma_providers::{
     ChatRequest, ContentBlock, Message, Model, ProviderEvent, Role, TokenUsage, provider_for,
 };
+use kudelma_storage::AuthStore;
 use kudelma_tools::{ToolContext, ToolRegistry, builtin_tools};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::approver::Approver;
 use crate::events::AgentEvent;
 use crate::orchestration::TaskContract;
-use crate::prompt::build_agency_prompt;
 use crate::runtime::RuntimeState;
 use crate::runtime_tools::register_lead_tools;
 use crate::tool_exec::{ToolRun, execute_call};
 
+fn text_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub enum AgencyOutcome {
     Reply,
     Handoff(Box<TaskContract>),
+    Blocked(String),
     Cancelled,
 }
 
@@ -29,9 +40,14 @@ pub struct AgencyAgent {
     pub events: UnboundedSender<AgentEvent>,
     pub ctx: ToolContext,
     pub max_turns: u32,
+    allowed_tools: Option<std::collections::HashSet<String>>,
+    disallowed_tools: std::collections::HashSet<String>,
+    auth: Option<AuthStore>,
+    dynamic_context_hash: Option<u64>,
 }
 
 impl AgencyAgent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime: Arc<RuntimeState>,
         model: Model,
@@ -39,6 +55,8 @@ impl AgencyAgent {
         approver: Arc<dyn Approver>,
         events: UnboundedSender<AgentEvent>,
         ctx: ToolContext,
+        allowed_tools: Option<std::collections::HashSet<String>>,
+        disallowed_tools: std::collections::HashSet<String>,
     ) -> Self {
         let max_turns = runtime.config.agency.turns();
         Self {
@@ -49,6 +67,53 @@ impl AgencyAgent {
             events,
             ctx,
             max_turns,
+            allowed_tools,
+            disallowed_tools,
+            auth: None,
+            dynamic_context_hash: None,
+        }
+    }
+
+    pub fn set_model(&mut self, spec: &str) -> Result<String, String> {
+        let auth = AuthStore::load().ok().or_else(|| self.auth.clone());
+        let model = resolve_model(&self.runtime.config, auth.as_ref(), spec)
+            .map_err(|error| error.to_string())?;
+        self.model = model;
+        self.auth = auth;
+        let spec = self.model.spec();
+        let _ = self
+            .events
+            .send(AgentEvent::Info(format!("Agency model: {spec}")));
+        Ok(spec)
+    }
+
+    pub fn update_auth(&mut self, auth: AuthStore) {
+        self.auth = Some(auth);
+    }
+
+    pub fn refresh_model(&mut self) -> Result<String, String> {
+        let spec = self.model.spec();
+        let auth = AuthStore::load().ok().or_else(|| self.auth.clone());
+        let model = resolve_model(&self.runtime.config, auth.as_ref(), &spec)
+            .map_err(|error| error.to_string())?;
+        self.model = model;
+        self.auth = auth;
+        Ok(self.model.spec())
+    }
+
+    fn sync_dynamic_context(&mut self) {
+        let context = crate::prompt::build_agency_context(
+            &self.runtime.config,
+            &self.runtime.cwd,
+            &self.runtime.skills,
+            self.runtime.contract().as_ref(),
+            Some(&self.runtime.workflow()),
+        );
+        let hash = text_hash(&context);
+        if self.dynamic_context_hash != Some(hash) {
+            self.dynamic_context_hash = Some(hash);
+            self.history
+                .push(Message::user(format!("[context update]\n{context}")));
         }
     }
 
@@ -70,18 +135,21 @@ impl AgencyAgent {
             .for_role(AgentRole::Agency, CoderScope::default()),
         );
         register_lead_tools(&registry, self.runtime.clone(), AgentRole::Agency);
+        registry.set_policy(kudelma_tools::ToolPolicy::new(
+            self.allowed_tools.clone().map(|set| set.into_iter()),
+            self.disallowed_tools.iter().cloned(),
+        ));
 
         for _ in 0..self.max_turns {
             if self.ctx.cancel.is_cancelled() {
                 return Ok(AgencyOutcome::Cancelled);
             }
-            let system = build_agency_prompt(
-                &self.runtime.config,
-                &self.runtime.cwd,
-                &self.runtime.skills,
-                self.runtime.contract().as_ref(),
-                Some(&self.runtime.workflow()),
-            );
+            if let Some(budget) = self.runtime.budget_blocker() {
+                return Ok(AgencyOutcome::Blocked(budget));
+            }
+            self.sync_dynamic_context();
+            let system =
+                crate::prompt::build_agency_stable_prompt(&self.runtime.config, &self.runtime.cwd);
             let request = ChatRequest {
                 messages: self.history.clone(),
                 system: Some(system),
@@ -89,6 +157,7 @@ impl AgencyAgent {
                 max_tokens: 4096.min(self.model.max_output_tokens),
                 temperature: None,
                 thinking: None,
+                session_id: Some(format!("{}:agency", self.runtime.session_id)),
             };
             let provider = provider_for(&self.model);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -123,6 +192,9 @@ impl AgencyAgent {
                 usage.output_tokens,
                 self.model.cost(usage),
             );
+            if let Some(budget) = self.runtime.budget_blocker() {
+                return Ok(AgencyOutcome::Blocked(budget));
+            }
             let mut blocks = Vec::new();
             if !text.is_empty() {
                 blocks.push(ContentBlock::Text { text });

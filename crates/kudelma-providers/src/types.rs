@@ -123,6 +123,7 @@ pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
     pub name: Option<String>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -165,6 +166,7 @@ pub struct ChatRequest {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub thinking: Option<ThinkingConfig>,
+    pub session_id: Option<String>,
 }
 
 impl ChatRequest {

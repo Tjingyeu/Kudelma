@@ -17,8 +17,8 @@ pub use lock::{ClaimError, SessionClaim};
 pub use memory::{MemoryEntry, MemoryStore};
 pub use paths::{
     canonicalize_lenient, clean_path, config_dir, contracts_dir, evidence_dir, exploration_dir,
-    incremental_canonicalize, is_within, plans_dir, sessions_dir, state_dir, tasks_dir,
-    user_skills_dir, workflows_dir,
+    incremental_canonicalize, is_within, plans_dir, reviews_dir, sessions_dir, state_dir,
+    tasks_dir, user_skills_dir, workflows_dir,
 };
 pub use sessions::{SessionError, SessionMeta, SessionStore, StoredSession};
 pub use store::ArtifactStore;

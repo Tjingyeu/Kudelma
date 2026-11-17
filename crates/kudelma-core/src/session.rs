@@ -179,6 +179,10 @@ impl SessionControl {
         let _ = self.commands.send(SessionCommand::SetModel(spec.into()));
     }
 
+    pub fn update_auth(&self, auth: AuthStore) {
+        let _ = self.commands.send(SessionCommand::UpdateAuth(auth));
+    }
+
     pub fn rewind(&self, user_index: usize) {
         let _ = self.commands.send(SessionCommand::Rewind(user_index));
     }
@@ -236,6 +240,10 @@ impl SessionHandle {
         self.control.set_model(spec);
     }
 
+    pub fn update_auth(&self, auth: AuthStore) {
+        self.control.update_auth(auth);
+    }
+
     pub fn rewind(&self, user_index: usize) {
         self.control.rewind(user_index);
     }
@@ -269,22 +277,55 @@ enum SessionCommand {
     SwitchToAgency,
     SetMode(AgentMode),
     SetModel(String),
+    UpdateAuth(AuthStore),
     Rewind(usize),
     Shutdown,
 }
 
 pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreError> {
-    let lead_spec = params
-        .model
-        .clone()
-        .or_else(|| {
-            params
-                .resume
-                .as_ref()
-                .map(|session| session.meta.model.clone())
+    let resume_lead = params
+        .resume
+        .as_ref()
+        .map(|session| {
+            if !session.meta.lead_model.is_empty() {
+                session.meta.lead_model.clone()
+            } else if session.meta.active_role == "lead" {
+                session.meta.model.clone()
+            } else {
+                String::new()
+            }
         })
+        .filter(|spec| !spec.is_empty());
+    let resume_agency = params
+        .resume
+        .as_ref()
+        .map(|session| {
+            if !session.meta.agency_model.is_empty() {
+                session.meta.agency_model.clone()
+            } else if session.meta.active_role != "lead" {
+                session.meta.model.clone()
+            } else {
+                String::new()
+            }
+        })
+        .filter(|spec| !spec.is_empty());
+    let initial_lead = params.direct_lead
+        || params
+            .resume
+            .as_ref()
+            .is_some_and(|session| session.meta.active_role == "lead");
+    let explicit = params.model.clone();
+    let lead_spec = explicit
+        .clone()
+        .or(resume_lead)
+        .or_else(|| params.config.role_model_spec("lead"))
         .unwrap_or_else(|| params.config.default_model.clone());
     let lead_model = resolve_model(&params.config, params.auth.as_ref(), &lead_spec)?;
+    let agency_spec = explicit
+        .or(resume_agency)
+        .or_else(|| params.config.role_model_spec("agency"))
+        .unwrap_or_else(|| lead_model.spec());
+    let agency_model = resolve_model(&params.config, params.auth.as_ref(), &agency_spec)?;
 
     let mut meta = params
         .resume
@@ -300,10 +341,16 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
             meta.id = id.clone();
         }
     }
-    meta.model = lead_model.spec();
-    if params.direct_lead {
+    if initial_lead {
         meta.active_role = "lead".into();
     }
+    meta.lead_model = lead_model.spec();
+    meta.agency_model = agency_model.spec();
+    meta.model = if initial_lead {
+        lead_model.spec()
+    } else {
+        agency_model.spec()
+    };
     if params.plan {
         meta.mode = "plan".into();
     } else if let Some(mode) = &params.mode {
@@ -450,12 +497,13 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
             .clone()
             .unwrap_or_else(|| PathBuf::from("plan.md")),
     ) {
-        runtime.set_mode(mode, "session start");
+        let _ = runtime.set_mode(mode, "session start");
     }
 
     let permissions = Arc::new(
         PermissionManager::new(&params.config, &params.cwd, params.trusted, params.yolo)
-            .for_role(kudelma_permissions::AgentRole::Lead, Default::default()),
+            .for_role(kudelma_permissions::AgentRole::Lead, Default::default())
+            .for_mode(runtime.mode().permission_mode()),
     );
 
     let mcp = mcp::connect_all(&params.config, params.trusted, &event_tx).await;
@@ -497,20 +545,17 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
         max_turns,
         system_prompt: params.system_prompt,
         append_system_prompt: params.append_system_prompt,
-        allowed_tools,
-        disallowed_tools,
+        allowed_tools: allowed_tools.clone(),
+        disallowed_tools: disallowed_tools.clone(),
         auth: params.auth.clone(),
         mcp_tools,
         mcp: mcp.manager,
         background_tx,
     });
-    agent.save_as_role(if params.direct_lead { "lead" } else { "agency" });
+    agent.save_as_role(if initial_lead { "lead" } else { "agency" });
     let handle_meta = agent.meta.clone();
     let timeline = agent.timeline();
 
-    let agency_model = runtime
-        .model_for("agency", &lead_model)
-        .unwrap_or_else(|_| lead_model.clone());
     let agency_ctx = ToolContext::new(
         Arc::new(LocalEnv::new(params.cwd.clone())),
         state_dir,
@@ -525,7 +570,12 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
         approver,
         event_tx.clone(),
         agency_ctx,
+        allowed_tools,
+        disallowed_tools,
     );
+    if let Some(auth) = params.auth.clone() {
+        agency.update_auth(auth);
+    }
     let mut pending_contract: Option<TaskContract> =
         runtime.contract().filter(TaskContract::needs_approval);
     if params.auto_approve_contracts {
@@ -534,7 +584,7 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
             pending_contract = None;
         }
     }
-    let mut active_lead = params.direct_lead || meta.active_role == "lead";
+    let mut active_lead = initial_lead;
     let mut clarification_rounds = 0u32;
     let auto_approve_contracts = params.auto_approve_contracts;
     let cwd = params.cwd.clone();
@@ -569,7 +619,7 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
                                         agent.save_as_role("agency");
                                         let _ = event_tx.send(AgentEvent::RoleChanged {
                                             role: "agency".into(),
-                                            model: runtime.model_for("agency", &agent.model).map(|model| model.spec()).unwrap_or_else(|_| agent.model.spec()),
+                                            model: agency.model.spec(),
                                         });
                                         let _ = agent.finish_external(crate::events::TurnEndReason::Completed).await;
                                     }
@@ -577,6 +627,12 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
                                         *agency_history.lock().unwrap_or_else(|e| e.into_inner()) = agency.history.clone();
                                         agent.save_as_role("agency");
                                         let _ = agent.finish_external(crate::events::TurnEndReason::Cancelled).await;
+                                    }
+                                    Ok(AgencyOutcome::Blocked(reason)) => {
+                                        *agency_history.lock().unwrap_or_else(|e| e.into_inner()) = agency.history.clone();
+                                        let _ = event_tx.send(AgentEvent::Error(reason));
+                                        agent.save_as_role("agency");
+                                        let _ = agent.finish_external(crate::events::TurnEndReason::Blocked).await;
                                     }
                                     Ok(AgencyOutcome::Handoff(contract)) => {
                                         let contract = *contract;
@@ -645,26 +701,33 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
                         }
                         Some(SessionCommand::SwitchToAgency) => {
                             active_lead = false;
+                            agent.save_as_role("agency");
                             let _ = event_tx.send(AgentEvent::RoleChanged {
                                 role: "agency".into(),
-                                model: runtime
-                                    .model_for("agency", &agent.model)
-                                    .map(|model| model.spec())
-                                    .unwrap_or_else(|_| agent.model.spec()),
+                                model: agency.model.spec(),
                             });
                             let _ = event_tx.send(AgentEvent::Info(
                                 "Agency mode: describe a new or revised request.".into(),
                             ));
                         }
                         Some(SessionCommand::SetMode(mode)) => {
-                            agent.set_mode(mode);
+                            match agent.set_mode(mode) {
+                                Ok(()) => {}
+                                Err(error) => agent.emit_error(error),
+                            }
                         }
-                        Some(SessionCommand::Verify(command)) => {                            match runtime.verifier.run(
-                                &command,
-                                &cwd,
-                                crate::verification::EvidenceKind::Custom,
-                                &agent.cancel_token(),
-                            ).await {
+                        Some(SessionCommand::Verify(command)) => {
+                            match runtime
+                                .verifier
+                                .run(
+                                    &command,
+                                    &cwd,
+                                    crate::verification::EvidenceKind::Custom,
+                                    runtime.mutation_generation(),
+                                    &agent.cancel_token(),
+                                )
+                                .await
+                            {
                                 Ok(evidence) => {
                                     runtime.record_verification(&evidence);
                                     let _ = event_tx.send(AgentEvent::Info(format!(
@@ -681,7 +744,24 @@ pub async fn spawn_session(params: SessionParams) -> Result<SessionHandle, CoreE
                             }
                         }
                         Some(SessionCommand::SetModel(spec)) => {
-                            if let Err(error) = agent.set_model(&spec) {
+                            if active_lead {
+                                if let Err(error) = agent.set_model(&spec) {
+                                    agent.emit_error(error);
+                                }
+                            } else {
+                                match agency.set_model(&spec) {
+                                    Ok(spec) => agent.set_agency_model(&spec),
+                                    Err(error) => agent.emit_error(error),
+                                }
+                            }
+                        }
+                        Some(SessionCommand::UpdateAuth(auth)) => {
+                            agent.update_auth(auth.clone());
+                            agency.update_auth(auth);
+                            if let Err(error) = agent.refresh_model() {
+                                agent.emit_error(error);
+                            }
+                            if let Err(error) = agency.refresh_model() {
                                 agent.emit_error(error);
                             }
                         }
@@ -743,7 +823,7 @@ async fn start_lead(
     } else {
         LeadMode::Build
     };
-    runtime.set_mode(mode.clone(), "handoff from agency");
+    let _ = runtime.set_mode(mode.clone(), "handoff from agency");
     let mut pack =
         ContextPack::new("agency", "approved task handoff").with_contract(contract.clone());
     pack.push(ContextItem::fact(format!(

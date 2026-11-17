@@ -53,6 +53,13 @@ pub struct Suggestion {
     pub file: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderChoice {
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
+}
+
 pub enum Overlay {
     Sessions {
         items: Vec<SessionMeta>,
@@ -61,6 +68,14 @@ pub enum Overlay {
     Models {
         items: Vec<Model>,
         selected: usize,
+    },
+    Providers {
+        items: Vec<ProviderChoice>,
+        selected: usize,
+    },
+    ConnectKey {
+        provider: ProviderChoice,
+        key: String,
     },
     Tasks {
         selected: usize,
@@ -81,6 +96,10 @@ pub enum Effect {
     SetMode(String),
     ApproveContract(Option<String>),
     Verify(String),
+    ConnectProvider {
+        provider: String,
+        key: String,
+    },
     SwitchToAgency,
     Compact,
     NewSession {
@@ -97,7 +116,12 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/sessions", "Browse saved sessions"),
     ("/resume <id>", "Resume a session by id"),
-    ("/model [spec]", "List or switch models"),
+    (
+        "/models",
+        "Choose a model; press c to connect another provider",
+    ),
+    ("/connect", "Connect or replace an API-key provider account"),
+    ("/model [spec]", "Switch directly to a provider/model"),
     ("/mode", "Switch Lead mode: plan, build, debug, review"),
     (
         "/contract",
@@ -145,6 +169,7 @@ pub struct App {
     pub(crate) suggestion_index: usize,
     pub(crate) files: Vec<String>,
     pub(crate) models: Vec<Model>,
+    pub(crate) providers: Vec<ProviderChoice>,
     pub(crate) theme: Theme,
     pub(crate) expand_tools: bool,
     pub(crate) expand_thinking: bool,
@@ -192,6 +217,7 @@ impl App {
             suggestion_index: 0,
             files,
             models,
+            providers: Vec::new(),
             theme,
             expand_tools: false,
             expand_thinking: false,
@@ -206,6 +232,7 @@ impl App {
             notice: None,
             meta,
         };
+        app.refresh_provider_choices();
         app.apply_timeline(&timeline);
         app
     }
@@ -234,6 +261,7 @@ impl App {
         self.session_id = meta.id.clone();
         self.meta = meta;
         self.models = models;
+        self.refresh_provider_choices();
         self.apply_timeline(&timeline);
     }
 
@@ -446,6 +474,10 @@ impl App {
                         .unwrap_or_default()
                 )));
             }
+            AgentEvent::ReviewUpdated(report) => {
+                self.notice = Some(format!("review: {}", report.status.name()));
+                self.blocks.push(Block::Info(report.render()));
+            }
             AgentEvent::TimelineReset(timeline) => {
                 self.blocks.clear();
                 self.apply_timeline(&timeline);
@@ -507,7 +539,44 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) {
-        self.insert_str(text);
+        if let Some(Overlay::ConnectKey { key, .. }) = self.overlay.as_mut() {
+            key.push_str(
+                &text
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .collect::<String>(),
+            );
+        } else {
+            self.insert_str(text);
+        }
+    }
+
+    pub fn refresh_models(&mut self, models: Vec<Model>) {
+        self.models = models;
+        self.refresh_provider_choices();
+    }
+
+    pub fn open_model_picker(&mut self) {
+        self.open_models();
+    }
+
+    fn refresh_provider_choices(&mut self) {
+        let mut connected = std::collections::BTreeMap::<String, bool>::new();
+        for model in &self.models {
+            let available = model.api_key.is_some() || model.is_local();
+            connected
+                .entry(model.provider.clone())
+                .and_modify(|value| *value |= available)
+                .or_insert(available);
+        }
+        self.providers = connected
+            .into_iter()
+            .map(|(id, connected)| ProviderChoice {
+                name: provider_display_name(&id),
+                id,
+                connected,
+            })
+            .collect();
     }
 
     pub fn on_mouse_scroll(&mut self, up: bool) {
@@ -730,8 +799,12 @@ impl App {
                 vec![]
             }
             "model" if !argument.is_empty() => vec![Effect::SetModel(argument.to_string())],
-            "model" => {
+            "model" | "models" => {
                 self.open_models();
+                vec![]
+            }
+            "connect" => {
+                self.open_providers();
                 vec![]
             }
             "mode" => vec![Effect::SetMode(if argument.is_empty() {
@@ -876,14 +949,36 @@ impl App {
     }
 
     fn open_models(&mut self) {
-        if self.models.is_empty() {
+        let available: Vec<Model> = self
+            .models
+            .iter()
+            .filter(|model| model.api_key.is_some() || model.is_local())
+            .cloned()
+            .collect();
+        if available.is_empty() {
+            self.open_providers();
+            return;
+        }
+        let selected = available
+            .iter()
+            .position(|model| model.spec() == self.model_spec)
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::Models {
+            items: available,
+            selected,
+        });
+    }
+
+    fn open_providers(&mut self) {
+        if self.providers.is_empty() {
             self.blocks.push(Block::Info(
-                "No models available. Check provider credentials.".into(),
+                "No providers are configured. Add a custom [providers.<id>] entry to config.toml first."
+                    .into(),
             ));
             return;
         }
-        self.overlay = Some(Overlay::Models {
-            items: self.models.clone(),
+        self.overlay = Some(Overlay::Providers {
+            items: self.providers.clone(),
             selected: 0,
         });
     }
@@ -972,6 +1067,10 @@ impl App {
                 mut selected,
             } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => vec![],
+                KeyCode::Char('c') => {
+                    self.open_providers();
+                    vec![]
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     selected = selected.saturating_sub(1);
                     self.overlay = Some(Overlay::Models { items, selected });
@@ -994,6 +1093,82 @@ impl App {
                 }
                 _ => {
                     self.overlay = Some(Overlay::Models { items, selected });
+                    vec![]
+                }
+            },
+            Overlay::Providers {
+                items,
+                mut selected,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => vec![],
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                    self.overlay = Some(Overlay::Providers { items, selected });
+                    vec![]
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(items.len().saturating_sub(1));
+                    self.overlay = Some(Overlay::Providers { items, selected });
+                    vec![]
+                }
+                KeyCode::Enter => {
+                    let Some(provider) = items.get(selected).cloned() else {
+                        return vec![];
+                    };
+                    self.overlay = Some(Overlay::ConnectKey {
+                        provider,
+                        key: String::new(),
+                    });
+                    vec![]
+                }
+                _ => {
+                    self.overlay = Some(Overlay::Providers { items, selected });
+                    vec![]
+                }
+            },
+            Overlay::ConnectKey {
+                provider,
+                key: mut api_key,
+            } => match key.code {
+                KeyCode::Esc => vec![],
+                KeyCode::Enter if api_key.trim().is_empty() => {
+                    self.blocks
+                        .push(Block::Error("API key cannot be empty.".into()));
+                    self.overlay = Some(Overlay::ConnectKey {
+                        provider,
+                        key: api_key,
+                    });
+                    vec![]
+                }
+                KeyCode::Enter => vec![Effect::ConnectProvider {
+                    provider: provider.id,
+                    key: api_key,
+                }],
+                KeyCode::Backspace => {
+                    api_key.pop();
+                    self.overlay = Some(Overlay::ConnectKey {
+                        provider,
+                        key: api_key,
+                    });
+                    vec![]
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !character.is_control() =>
+                {
+                    api_key.push(character);
+                    self.overlay = Some(Overlay::ConnectKey {
+                        provider,
+                        key: api_key,
+                    });
+                    vec![]
+                }
+                _ => {
+                    self.overlay = Some(Overlay::ConnectKey {
+                        provider,
+                        key: api_key,
+                    });
                     vec![]
                 }
             },
@@ -1355,5 +1530,106 @@ fn next_mode(current: &str) -> &'static str {
         "plan" => "debug",
         "debug" => "review",
         _ => "build",
+    }
+}
+
+fn provider_display_name(provider: &str) -> String {
+    match provider {
+        "anthropic" => "Anthropic".into(),
+        "openai" => "OpenAI".into(),
+        "opencode-go" => "OpenCode Go".into(),
+        "moonshot" => "Moonshot".into(),
+        "deepseek" => "DeepSeek".into(),
+        "gemini" => "Google Gemini".into(),
+        "openrouter" => "OpenRouter".into(),
+        "xai" => "xAI".into(),
+        "ollama" => "Ollama".into(),
+        custom => custom
+            .split(['-', '_'])
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app() -> App {
+        App::new(
+            SessionMeta::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Theme::for_name("system"),
+            PathBuf::from("."),
+        )
+    }
+
+    fn provider() -> ProviderChoice {
+        ProviderChoice {
+            id: "opencode-go".into(),
+            name: "OpenCode Go".into(),
+            connected: false,
+        }
+    }
+
+    #[test]
+    fn pasted_api_key_never_enters_the_prompt() {
+        let mut app = app();
+        app.overlay = Some(Overlay::ConnectKey {
+            provider: provider(),
+            key: String::new(),
+        });
+        app.on_paste("sk-secret");
+        assert!(app.input.is_empty());
+        match app.overlay.as_ref().unwrap() {
+            Overlay::ConnectKey { key, .. } => assert_eq!(key, "sk-secret"),
+            _ => panic!("connect overlay closed"),
+        }
+    }
+
+    #[test]
+    fn enter_emits_a_connect_effect_with_the_hidden_key() {
+        let mut app = app();
+        app.overlay = Some(Overlay::ConnectKey {
+            provider: provider(),
+            key: "sk-secret".into(),
+        });
+        let effects = app.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::ConnectProvider { provider, key } => {
+                assert_eq!(provider, "opencode-go");
+                assert_eq!(key, "sk-secret");
+            }
+            _ => panic!("expected ConnectProvider"),
+        }
+    }
+
+    #[test]
+    fn escape_closes_the_connect_overlay_without_leaking_the_key() {
+        let mut app = app();
+        app.overlay = Some(Overlay::ConnectKey {
+            provider: provider(),
+            key: "sk-secret".into(),
+        });
+        assert!(
+            app.handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_empty()
+        );
+        assert!(app.overlay.is_none());
+        assert!(app.blocks.iter().all(|block| match block {
+            Block::Info(text) | Block::Error(text) => !text.contains("sk-secret"),
+            _ => true,
+        }));
     }
 }

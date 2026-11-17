@@ -9,6 +9,7 @@ pub async fn summarize(
     model: &kudelma_providers::Model,
     history: &[Message],
     instructions: Option<&str>,
+    session_id: &str,
     cancel: &CancelToken,
 ) -> Result<String, ProviderError> {
     let mut transcript = String::new();
@@ -60,6 +61,7 @@ pub async fn summarize(
         max_tokens: 4096.min(model.max_output_tokens),
         temperature: Some(0.2),
         thinking: None,
+        session_id: Some(session_id.to_string()),
     };
     let provider = provider_for(model);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

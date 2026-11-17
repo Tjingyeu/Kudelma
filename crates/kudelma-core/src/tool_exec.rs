@@ -83,7 +83,7 @@ pub async fn execute_call(run: ToolRun<'_>, call: &ToolCall) -> ToolResult {
         Err(error) => ToolOutput::error(error.to_string()),
     };
 
-    hooks::run_post_tool(
+    if let Some(message) = hooks::run_post_tool(
         run.hooks,
         &call.name,
         &call.input,
@@ -91,7 +91,10 @@ pub async fn execute_call(run: ToolRun<'_>, call: &ToolCall) -> ToolResult {
         run.ctx.cwd(),
         &run.ctx.cancel,
     )
-    .await;
+    .await
+    {
+        let _ = run.events.send(AgentEvent::Info(message));
+    }
 
     if run.emit {
         let _ = run.events.send(AgentEvent::ToolEnd {
@@ -124,22 +127,31 @@ async fn check_permission(
     tool_name: &str,
     permission: &kudelma_tools::ToolPermission,
 ) -> Result<(), String> {
-    let check = run
-        .permissions
-        .check_with_force(&key, &permission.scopes, permission.force_prompt);
+    let check = run.permissions.check_with_context(
+        &key,
+        &permission.scopes,
+        permission.force_prompt,
+        permission.cwd.as_deref(),
+    );
     match check {
         PermissionCheck::Allowed => Ok(()),
         PermissionCheck::Denied(reason) => Err(format!(
             "Permission denied for `{tool_name}` ({}): {reason}. Do not retry; choose another approach or ask the user.",
             scope_text(&permission.scopes)
         )),
-        PermissionCheck::NeedsPrompt { scopes, reason, .. } => {
+        PermissionCheck::NeedsPrompt {
+            scopes,
+            reason,
+            requires_exact,
+            ..
+        } => {
             let request_id = uuid::Uuid::new_v4().to_string();
             let ask = PermissionAsk {
                 request_id: request_id.clone(),
                 tool: tool_name.to_string(),
                 scopes: scopes.iter().map(|scope| scope.value.clone()).collect(),
                 reason: permission.reason.clone().or(reason),
+                requires_exact,
             };
             let answer = run.approver.ask(ask).await;
             if let Err(error) = run.permissions.apply_decision(&key, &scopes, &answer) {
@@ -192,6 +204,7 @@ fn tool_result(
         content,
         is_error,
         name: Some(call.name.clone()),
+        metadata,
     }
 }
 

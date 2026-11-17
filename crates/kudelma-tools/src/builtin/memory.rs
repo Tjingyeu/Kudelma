@@ -16,6 +16,10 @@ impl Tool for MemoryTool {
         "memory"
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &'static str {
         "Store durable project or global notes (build commands, conventions, user preferences) and list or remove them later."
     }

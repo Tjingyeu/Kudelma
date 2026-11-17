@@ -348,6 +348,7 @@ mod tests {
                     content: "ok".into(),
                     is_error: false,
                     name: Some("read".into()),
+                    metadata: None,
                 }]),
             ],
             system: None,
@@ -359,6 +360,7 @@ mod tests {
             max_tokens: 4096,
             temperature: None,
             thinking: None,
+            session_id: None,
         };
         let body = anthropic_body(&model, &request);
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");

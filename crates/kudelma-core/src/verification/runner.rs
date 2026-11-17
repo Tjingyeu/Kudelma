@@ -5,6 +5,7 @@ use kudelma_storage::{ArtifactStore, atomic_write, now_rfc3339};
 use serde_json::json;
 
 use super::evidence::{EvidenceKind, EvidenceResult, ExecutionEvidence};
+use super::revision::WorkspaceRevision;
 
 const MAX_EXCERPT: usize = 8_000;
 const VERIFY_TIMEOUT_SECS: u64 = 900;
@@ -42,11 +43,12 @@ impl Verifier {
         command: &str,
         cwd: &Path,
         kind: EvidenceKind,
+        mutation_generation: u64,
         cancel: &CancelToken,
     ) -> Result<ExecutionEvidence, String> {
         let id = kudelma_storage::new_id();
         let started_at = now_rfc3339();
-        let (git_head, git_diff_hash, changed_files) = git_metadata(cwd).await;
+        let revision_before = WorkspaceRevision::capture(cwd, mutation_generation).await;
         let mut process = tokio::process::Command::new("bash");
         process
             .arg("-lc")
@@ -66,6 +68,7 @@ impl Verifier {
             }
         };
         let ended_at = now_rfc3339();
+        let revision_after = WorkspaceRevision::capture(cwd, mutation_generation).await;
         let (exit_code, stdout, stderr, result) = match output {
             Ok(Ok(output)) => {
                 let result = if output.status.success() {
@@ -101,16 +104,18 @@ impl Verifier {
             id,
             kind,
             command: command.into(),
-            cwd: cwd.display().to_string(),
+            cwd: revision_after.workspace.clone(),
             started_at,
             ended_at,
             exit_code,
             stdout_excerpt: excerpt(&stdout),
             stderr_excerpt: excerpt(&stderr),
             log_path: Some(log_path.display().to_string()),
-            git_head,
-            git_diff_hash,
-            changed_files,
+            git_head: revision_after.git_head.clone(),
+            git_diff_hash: revision_after.diff_hash.clone(),
+            revision_before: Some(revision_before),
+            revision_after: Some(revision_after),
+            changed_files: changed_files(cwd).await,
             result,
             skip_reason: None,
         };
@@ -140,6 +145,8 @@ impl Verifier {
             log_path: None,
             git_head: None,
             git_diff_hash: None,
+            revision_before: None,
+            revision_after: None,
             changed_files: Vec::new(),
             result: EvidenceResult::Skipped,
             skip_reason: Some(reason.into()),
@@ -163,32 +170,8 @@ impl Verifier {
     }
 }
 
-async fn git_metadata(cwd: &Path) -> (Option<String>, Option<String>, Vec<String>) {
-    let head = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-    let diff = tokio::process::Command::new("git")
-        .args(["diff", "HEAD", "--binary"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| output.stdout);
-    let diff_hash = diff.map(|bytes| {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        format!("{hash:016x}")
-    });
-    let changed_files = tokio::process::Command::new("git")
+async fn changed_files(cwd: &Path) -> Vec<String> {
+    tokio::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(cwd)
         .output()
@@ -202,8 +185,7 @@ async fn git_metadata(cwd: &Path) -> (Option<String>, Option<String>, Vec<String
                 .filter(|line| !line.is_empty())
                 .collect()
         })
-        .unwrap_or_default();
-    (head, diff_hash, changed_files)
+        .unwrap_or_default()
 }
 
 fn excerpt(text: &str) -> String {

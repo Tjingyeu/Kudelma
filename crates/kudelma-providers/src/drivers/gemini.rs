@@ -267,6 +267,7 @@ mod tests {
             max_tokens: 10,
             temperature: None,
             thinking: None,
+            session_id: None,
         };
         let body = gemini_body(&model, &request);
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");

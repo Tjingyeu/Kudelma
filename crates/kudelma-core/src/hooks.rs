@@ -33,24 +33,24 @@ pub async fn run_pre_tool(
     .await
     {
         Ok((code, _stdout, stderr)) => {
-            if code == 2 {
-                HookOutcome {
-                    allowed: false,
-                    message: Some(if stderr.trim().is_empty() {
-                        "blocked by the pre_tool_use hook".into()
-                    } else {
-                        stderr.trim().to_string()
-                    }),
-                }
-            } else {
+            if code == 0 {
                 HookOutcome {
                     allowed: true,
                     message: (!stderr.trim().is_empty()).then(|| stderr.trim().to_string()),
                 }
+            } else {
+                HookOutcome {
+                    allowed: false,
+                    message: Some(if stderr.trim().is_empty() {
+                        format!("pre_tool_use hook exited with code {code}")
+                    } else {
+                        stderr.trim().to_string()
+                    }),
+                }
             }
         }
         Err(error) => HookOutcome {
-            allowed: true,
+            allowed: false,
             message: Some(format!("pre_tool_use hook failed: {error}")),
         },
     }
@@ -63,25 +63,50 @@ pub async fn run_post_tool(
     output: &str,
     cwd: &std::path::Path,
     cancel: &CancelToken,
-) {
-    let Some(script) = &hooks.post_tool_use else {
-        return;
-    };
-    let _ = run_hook(
+) -> Option<String> {
+    let script = hooks.post_tool_use.as_ref()?;
+    match run_hook(
         script,
         "post_tool_use",
         json!({ "tool": tool, "input": input, "output": output }),
         cwd,
         cancel,
     )
-    .await;
+    .await
+    {
+        Ok((0, _, stderr)) => {
+            let stderr = stderr.trim();
+            (!stderr.is_empty()).then(|| stderr.to_string())
+        }
+        Ok((code, _, stderr)) => Some(format!(
+            "post_tool_use hook exited with code {code}{}",
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )),
+        Err(error) => Some(format!("post_tool_use hook failed: {error}")),
+    }
 }
 
-pub async fn run_session_end(hooks: &HooksConfig, cwd: &std::path::Path) {
-    let Some(script) = &hooks.session_end else {
-        return;
-    };
-    let _ = run_hook(script, "session_end", json!({}), cwd, &CancelToken::new()).await;
+pub async fn run_session_end(hooks: &HooksConfig, cwd: &std::path::Path) -> Option<String> {
+    let script = hooks.session_end.as_ref()?;
+    match run_hook(script, "session_end", json!({}), cwd, &CancelToken::new()).await {
+        Ok((0, _, stderr)) => {
+            let stderr = stderr.trim();
+            (!stderr.is_empty()).then(|| stderr.to_string())
+        }
+        Ok((code, _, stderr)) => Some(format!(
+            "session_end hook exited with code {code}{}",
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )),
+        Err(error) => Some(format!("session_end hook failed: {error}")),
+    }
 }
 
 async fn run_hook(
@@ -124,5 +149,62 @@ async fn run_hook(
             ))
         }
         _ = cancel.cancelled() => Err("hook cancelled".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hooks(script: &str) -> HooksConfig {
+        HooksConfig {
+            pre_tool_use: Some(script.into()),
+            post_tool_use: None,
+            session_end: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_allows_exit_zero() {
+        let outcome = run_pre_tool(
+            &hooks("exit 0"),
+            "read",
+            &json!({}),
+            std::path::Path::new("."),
+            &CancelToken::new(),
+        )
+        .await;
+        assert!(outcome.allowed);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_denies_exit_two_and_other_failures() {
+        for script in ["echo blocked >&2; exit 2", "exit 1"] {
+            let outcome = run_pre_tool(
+                &hooks(script),
+                "read",
+                &json!({}),
+                std::path::Path::new("."),
+                &CancelToken::new(),
+            )
+            .await;
+            assert!(!outcome.allowed);
+            assert!(outcome.message.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_fails_closed_when_cancelled() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let outcome = run_pre_tool(
+            &hooks("sleep 5"),
+            "read",
+            &json!({}),
+            std::path::Path::new("."),
+            &cancel,
+        )
+        .await;
+        assert!(!outcome.allowed);
     }
 }
